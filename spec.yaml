@@ -1,0 +1,50 @@
+name: baidu-easy
+function: 把 bdpan 封装成带测试网页的 HTTP API，打包进 Docker 镜像，供其他程序通过网络调用
+modules:
+  - path: internal/bdpan
+    function: bdpan 命令行适配：执行白名单子命令并把结果和错误归一化
+  - path: internal/api
+    function: HTTP 接口：鉴权、参数校验、调用 bdpan 适配、统一 JSON 响应、文件流传输
+  - path: web
+    function: 测试网页：登录与手动试用全部网盘操作
+input:
+  - name: BAIDU_EASY_API_KEY
+    type: env string
+    desc: 访问密钥；必填
+  - name: BAIDU_EASY_ADDR
+    type: env string
+    desc: 监听地址；默认 :8080
+  - name: BAIDU_EASY_BDPAN_BIN
+    type: env string
+    desc: bdpan 可执行文件路径；默认 bdpan
+  - name: BDPAN_CONFIG_DIR
+    type: env string
+    desc: bdpan 配置目录；镜像内固定为 /data/bdpan
+  - name: TMPDIR
+    type: env string
+    desc: 上传、下载临时文件目录；默认系统临时目录
+output:
+  - name: http
+    type: HTTP service
+    desc: 在监听地址上提供 /api/* 接口与测试网页 /
+  - name: image
+    type: Docker image
+    desc: 包含服务程序与固定版本 bdpan 的镜像
+contract:
+  - 未配置 BAIDU_EASY_API_KEY 时拒绝启动并输出原因
+  - 镜像内 bdpan 版本固定，构建时校验 SHA256，校验失败则构建失败
+  - 镜像内不包含任何 bdpan 凭据；/data 为持久卷，bdpan 配置只写入 /data/bdpan
+  - 容器以非 root 用户运行
+  - 支持 linux/amd64 与 linux/arm64
+  - 不提供 bdpan 更新能力；升级 bdpan 只通过重建镜像
+depends:
+  - internal/api
+  - web
+  - ext:docker
+errors:
+  - code: config_missing
+    desc: 未配置访问密钥；进程以非零码退出
+tests:
+  - 独立测试：缺少访问密钥时进程拒绝启动；两个平台的镜像都能构建，容器内 bdpan 版本与固定版本一致
+  - 组合测试：服务连同替身 bdpan 启动，获取测试网页后带密钥依次调用登录、列表、上传、下载、删除，检查统一响应格式，结束后临时目录为空
+  - Integration Test：真实账号，构建并启动容器 → 通过测试网页登录 → 在 我的应用数据/bdpan/baidu-easy-test/ 下完成 上传 → 列表 → 下载比对内容 → 分享 → 删除 → 重建容器后登录状态仍有效

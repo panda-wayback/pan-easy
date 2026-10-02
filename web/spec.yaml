@@ -1,0 +1,20 @@
+name: web
+function: 测试网页：登录与手动试用全部网盘操作
+modules: []
+input: []
+output:
+  - name: index.html
+    type: static page
+    desc: 由服务在 GET / 提供的单个静态页面
+contract:
+  - 只调用本服务 /api/* 接口
+  - 使用前输入访问密钥；密钥只保存在浏览器本地，可在页面上清除
+  - 登录：显示安全须知并要求勾选确认，显示授权链接，粘贴授权码提交，显示登录状态
+  - 覆盖列表、搜索、上传、下载、转存、分享、建目录、移动、复制、重命名、删除
+  - 接口错误原样显示 error.code 与 message
+  - 不依赖前端构建流程与外部 CDN 资源
+depends: []
+errors: []
+tests:
+  - 服务 GET / 返回该页面
+  - 手动清单：输入密钥 → 登录 → 逐项执行全部网盘操作 → 错误密钥时显示 unauthorized

@@ -1,0 +1,51 @@
+name: bdpan
+function: bdpan 命令行适配：执行白名单子命令并把结果和错误归一化
+modules: []
+input:
+  - name: command
+    type: string
+    desc: 子命令；白名单 whoami / ls / search / upload / download / transfer / share / mkdir / mv / cp / rename / rm / login
+  - name: args
+    type: list of string
+    desc: 子命令参数
+  - name: stdin
+    type: bytes, optional
+    desc: 标准输入内容；仅 login 提交授权码时使用
+  - name: ctx
+    type: context
+    desc: 调用方上下文；取消时终止 bdpan 进程
+output:
+  - name: result
+    type: JSON object
+    desc: bdpan --json 输出解析结果
+  - name: error
+    type: Error{kind, errno, message}
+    desc: 归一化错误；kind 取值见 errors
+contract:
+  - 子命令不在白名单内时直接返回错误，不启动进程
+  - 参数以进程参数数组传递，不经过 shell
+  - 每次调用附加 --json 与 --no-check-update
+  - whoami / ls / search / mkdir / mv / cp / rename / rm / share 超时 60 秒；login 超时 30 秒；upload / download / transfer 只受 ctx 控制
+  - 不读取、不输出 bdpan 配置文件与 Token；返回结果与错误信息中不包含授权码
+  - 授权码只通过 stdin 传给 bdpan，不出现在进程参数中
+  - errno 与 message 原样保留 bdpan 返回值
+depends:
+  - ext:bdpan-cli
+errors:
+  - code: not_logged_in
+    desc: bdpan 报告未登录
+  - code: token_expired
+    desc: bdpan 报告 Token 失效
+  - code: bdpan_error
+    desc: bdpan 返回业务错误；携带 errno 与 message
+  - code: timeout
+    desc: 超过超时时间；进程已终止
+  - code: not_found
+    desc: bdpan 可执行文件不存在
+  - code: forbidden_command
+    desc: 子命令不在白名单
+tests:
+  - 用假 bdpan 脚本返回预设 JSON 与错误，验证参数拼装（含 --json、--no-check-update）
+  - 验证未登录、Token 失效、业务错误的归一化与 errno 保留
+  - 验证超时终止进程、ctx 取消终止进程
+  - 验证白名单外子命令不启动进程；授权码不出现在进程参数与错误信息中

@@ -1,0 +1,97 @@
+name: api
+function: HTTP 接口：鉴权、参数校验、调用 bdpan 适配、统一 JSON 响应、文件流传输
+modules: []
+input:
+  - name: Authorization
+    type: header "Bearer <key>"
+    desc: 访问密钥；所有 /api/* 必填
+  - name: GET /api/status
+    type: 无参数
+    desc: 查看登录状态
+  - name: POST /api/login/url
+    type: JSON {accept_disclaimer:bool}
+    desc: 获取授权链接；accept_disclaimer 必须为 true
+  - name: POST /api/login/code
+    type: JSON {code:string}
+    desc: 提交授权码；32 位十六进制
+  - name: GET /api/ls
+    type: query path?, order?(name|time|size), desc?(bool), folder?(bool)
+    desc: 列出目录
+  - name: GET /api/search
+    type: query q, category?(0-7), scope?(all|no_dir|dir_only), page?, page_size?
+    desc: 搜索文件
+  - name: POST /api/upload
+    type: multipart file, remote_path
+    desc: 上传单个文件；remote_path 为文件路径，不能以 / 结尾
+  - name: GET /api/download
+    type: query path
+    desc: 下载单个文件
+  - name: POST /api/transfer
+    type: JSON {url, pwd?, dir?}
+    desc: 转存分享链接
+  - name: POST /api/share
+    type: JSON {paths:[string], period?(0|1|7|30)}
+    desc: 创建分享链接；period 默认 7
+  - name: POST /api/mkdir
+    type: JSON {path}
+    desc: 创建文件夹
+  - name: POST /api/mv
+    type: JSON {src, dst}
+    desc: 移动到目标目录
+  - name: POST /api/cp
+    type: JSON {src, dst}
+    desc: 复制到目标目录
+  - name: POST /api/rename
+    type: JSON {path, name}
+    desc: 重命名；name 为新文件名
+  - name: POST /api/rm
+    type: JSON {paths:[string]}
+    desc: 删除
+output:
+  - name: success
+    type: JSON {ok:true, data}
+    desc: data 为 bdpan 返回结果原样透传
+  - name: submitted
+    type: HTTP 202 JSON {ok:true, data:{status:"submitted", task_id, ...}}
+    desc: 转存任务已提交但未完成
+  - name: failure
+    type: JSON {ok:false, error:{code, message, errno?}}
+    desc: code 取值见 errors
+  - name: download
+    type: application/octet-stream
+    desc: 下载成功时返回文件流，带 Content-Disposition 文件名
+contract:
+  - 所有 /api/* 校验访问密钥，比较使用常量时间
+  - 网盘路径均为相对 我的应用数据/bdpan 的相对路径；含 .. 或以 /、~ 开头时拒绝
+  - login/url 与 login/code 串行执行，同一时刻只有一个登录操作
+  - 上传、下载经临时文件中转；请求结束（成功、失败、客户端断开）后临时文件必定删除
+  - 下载目标为目录时拒绝
+  - 转存未完成时返回 202 与任务 ID，不返回 ok 完成态
+  - 响应中不出现 Token、配置内容与授权码
+depends:
+  - internal/bdpan
+errors:
+  - code: unauthorized
+    desc: 缺少或错误的访问密钥；HTTP 401
+  - code: invalid_argument
+    desc: 参数缺失、格式错误、路径越界、下载目标为目录、未确认安全须知；HTTP 400
+  - code: auth_code_invalid
+    desc: 授权码格式错误、错误或过期；HTTP 400
+  - code: not_logged_in
+    desc: 未登录；HTTP 409
+  - code: token_expired
+    desc: Token 失效需重新登录；HTTP 409
+  - code: bdpan_error
+    desc: bdpan 业务错误，携带 errno；HTTP 502
+  - code: timeout
+    desc: bdpan 调用超时；HTTP 504
+  - code: internal
+    desc: 服务内部错误；HTTP 500
+tests:
+  - 用替身 bdpan 适配器做 HTTP 测试
+  - 鉴权：无密钥、错误密钥返回 401；正确密钥放行
+  - 每个接口的参数校验与到 bdpan 子命令参数的映射
+  - 路径越界、下载目录、未确认安全须知、授权码格式错误均返回 400
+  - 上传、下载在成功、失败、客户端断开三种情况下临时文件都被删除
+  - 转存 submitted 返回 202 与任务 ID
+  - 适配器各类错误到 HTTP 状态码与 error.code 的映射

@@ -1,0 +1,93 @@
+---
+description: >-
+  通用工作流：Agent 判断、方案先行、Skill 调度。写/改自维护 Skill 另遵 skill-writing.mdc。可整包复制到他仓。
+alwaysApply: true
+---
+
+# 工作流硬约束（通用）
+
+写/改**自维护** `.cursor/skills/**` → 先遵 `skill-writing.mdc`。
+
+## 通用 vs 不通用
+
+**通用 = 工作方式 + 工具（整包复制到任意新项目）**
+
+| 路径 | 职责 |
+|---|---|
+| `.cursor/rules/workflow.mdc` | 本文件：判断、方案先行、调度 |
+| `.cursor/rules/skill-writing.mdc` | 自维护 Skill 写法 |
+| `.cursor/skills/doc-node-graph/` | `docs/` 怎么写、怎么推进 |
+| `.cursor/skills/pseudo-software/` | 伪软件：拆模块、落成 `spec.yaml` |
+| `.cursor/skills/ui-ux-pro-max/` | UI/UX 设计辅助（导入 Skill，原样拷贝） |
+
+另属通用、但不靠「拷贝旧仓正文」获得：
+
+- 目录约定：每个项目都有 `docs/`；先完善 `docs/` 再写代码
+- 新仓用 `pseudo-software/templates/` 生成空 `spec.yaml`，禁止拷贝他仓已填业务的索引 / `docs` 正文
+
+**不通用 = 某一产品已经写进去的内容（禁止写进通用 `.cursor` 文件）**
+
+- 本仓 `docs/**` 已写的能力页正文（目标、业务步骤、产品名词）
+- 本仓已填的 `spec.yaml` 树
+- 仅本仓成立的业务禁令 / 模块表 / 依赖特例（写在本仓 `docs/`；确有必要时再另建本仓 rule，勿改通用包）
+
+## Agent 判断
+
+降低决策成本，**禁止失控**。
+
+**降成本（怎么说）**
+
+1. 分析需求后给出 **一个最佳方案**（可附一句收益/代价）；用户只裁定接受 / 驳回或改一点。
+2. 禁止无推荐的选项清单、「你更倾向哪种」、长对比表当主交付。
+3. 确无唯一最优：最多 2～3 条各一行并标 **推荐**；用户仍只裁定该推荐。
+
+**防失控（何时能动）**
+
+4. **须用户裁定后才能做**：写/改 `docs/` 产品正文与架构决策；改已定方案；实现新功能/产品逻辑。未裁定禁止写入 docs、禁止先写代码。
+5. **可直接做**（无需再问）：Bug / 重构 / 性能 / 测试；docs 未点名且无调用的私有/薄包装删除；纯机械同步（断链、推进句对齐）。
+6. 禁止琐碎确认（「是否继续」「这几处可以删吗」）。
+7. 须提问仅当：不可逆/越权（删用户数据、破坏性 git、泄密、用户已明令先问）。
+8. 判定不合理 → 坚持合理做法，禁止迎合；禁止未裁定就「自行推进」产品/架构变更。
+
+## 方案先行
+
+所有项目统一：先完善 `docs/`，再实现。
+
+```text
+Agent 给最佳方案 → 用户裁定合理 → 写 docs/（完备）→ 伪软件拆分草稿 → 用户裁定 → 落成 spec.yaml → 再写代码
+```
+
+1. 新功能 / 改产品逻辑或架构：禁止先写代码；先按上式入 `docs/`。
+   - `docs/` 未完成且用户未裁定前，禁止生成 `spec.yaml`，禁止写任何业务代码。
+   - `docs/` 完成后，须先在对话中给出模块拆分草稿，经用户裁定后再落成 `spec.yaml`；禁止在 `docs/` 中再写一份模块拆分。
+
+## docs 目录结构
+
+能力文档按功能分类，服务端与客户端分开，每个能力独立目录，目录内统一用 `README.md`：
+
+```text
+docs/
+  README.md                       # 根能力索引
+  server/key-management/README.md # 服务端能力
+  server/device-binding/README.md
+  client/fingerprint/README.md    # 客户端能力
+  client/activation/README.md
+```
+
+禁止在 `docs/` 根目录下平铺多个能力文档。模块拆分只在对话中进行，落成 `spec.yaml`，禁止在 `docs/` 中重复写模块拆分。
+2. 实现以当前 `docs/` 与 `spec.yaml` 为准；禁止未裁定就改已定方案。
+3. 实现中发现方案问题 → 先给最佳判断 → 裁定后 `改 docs / 改 spec.yaml → 改代码`；禁止偷偷改设计。
+4. 可直接改代码：Bug / 重构 / 性能 / 测试；以及 **docs 未点名** 且无调用的私有/薄包装删除。
+5. **docs 已写的对外符号、步骤**：删改须同轮改 docs（或先走方案先行）；禁止只改代码留下过期方案。
+6. `方案问题 → docs / spec.yaml`；`实现问题 → code`。保持简单，不堆多余流程。
+7. 文档必须合理；禁止不合理或未裁定内容入档。
+
+## 何时 Read Skill
+
+| 触发 | Skill |
+|---|---|
+| 探讨方案、写/改 docs、选下一步 | `.cursor/skills/doc-node-graph/SKILL.md` |
+| 进入模块设计、改模块契约、写/审 `spec.yaml` | `.cursor/skills/pseudo-software/SKILL.md` |
+| UI/UX 设计、改界面观感、配色排版动效 | `.cursor/skills/ui-ux-pro-max/SKILL.md` |
+
+产品正文只写在 `docs/`，禁止写进 Skill。细则以 Skill 正文为准；本文件只调度。
