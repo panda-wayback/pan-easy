@@ -166,15 +166,68 @@ def test_history_persists_and_unfinished_become_interrupted(tmp_path):
         return done, pending
 
     done, pending = asyncio.run(scenario())
-    assert "1111" not in tasks_file.read_text(encoding="utf-8")
-
     reloaded = TaskQueue(ScriptedBdpan([]), str(tmp_path), str(tasks_file))
+    assert reloaded.get(done["id"])["pwd"] == "1111"
     assert [t["id"] for t in reloaded.list()] == [pending["id"], done["id"]]
     assert reloaded.get(done["id"])["status"] == "done"
     assert reloaded.get(done["id"])["saved_to"] == "a.zip"
     got = reloaded.get(pending["id"])
     assert got["status"] == "failed" and got["error"]["code"] == "interrupted"
     assert TaskQueue(ScriptedBdpan([]), str(tmp_path), str(tasks_file)).get(pending["id"])["status"] == "failed"
+
+
+def test_retry(tmp_path):
+    bdpan = ScriptedBdpan([
+        ([], BdpanError("bdpan_error", "网络错误", None)),
+        ([], {"local": str(tmp_path) + "/", "items": [{"name": "a.txt", "type": "file"}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path))
+
+    async def scenario():
+        first = queue.submit("链接 https://pan.baidu.com/s/1fail 提取码：1111")
+        await wait_finished(queue, 1)
+        new = queue.retry(first["id"])
+        await wait_finished(queue, 2)
+        return first, new
+
+    first, new = asyncio.run(scenario())
+    assert new is not None and new["id"] != first["id"] and new["url"] == first["url"]
+    assert [t["id"] for t in queue.list()] == [new["id"], first["id"]]
+    assert bdpan.calls[1][2][:2] == ["-p", "1111"]
+    assert queue.get(first["id"])["status"] == "failed"
+    assert queue.get(new["id"])["status"] == "done"
+    assert queue.get(new["id"])["saved_to"] == "a.txt"
+    assert queue.retry("nope") is None
+    assert queue.retry(new["id"]) is None
+
+
+def test_delete(tmp_path):
+    class BlockingBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            if positionals[0].endswith("1slow"):
+                self.calls.append((command, list(positionals), list(flags)))
+                await asyncio.sleep(3600)
+            return await super().run(command, positionals, flags, stdin, on_output)
+
+    bdpan = BlockingBdpan([([], {"local": str(tmp_path / "c.txt")})])
+    queue = TaskQueue(bdpan, str(tmp_path))
+
+    async def scenario():
+        running = queue.submit("https://pan.baidu.com/s/1slow")
+        queued = queue.submit("https://pan.baidu.com/s/1skip")
+        last = queue.submit("https://pan.baidu.com/s/1last")
+        await asyncio.sleep(0.05)
+        assert queue.get(running["id"])["status"] == "running"
+        assert await queue.delete(queued["id"]) is True
+        assert await queue.delete(running["id"]) is True
+        await wait_finished(queue, 1)
+        assert await queue.delete("nope") is False
+        return running, queued, last
+
+    running, queued, last = asyncio.run(scenario())
+    assert queue.get(running["id"]) is None and queue.get(queued["id"]) is None
+    assert queue.get(last["id"])["status"] == "done"
+    assert [c[1][0] for c in bdpan.calls] == ["https://pan.baidu.com/s/1slow", "https://pan.baidu.com/s/1last"]
 
 
 def test_failure_keeps_error(tmp_path):

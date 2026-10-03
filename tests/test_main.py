@@ -121,53 +121,65 @@ def test_download_link(fake_bin, tmp_path):
         _task("escape", saved_to="../tasks.json"),
     ]
     tasks_file.write_text(json.dumps(tasks), encoding="utf-8")
-    client = TestClient(create_app(KEY, fake_bin, download_dir=str(downloads), tasks_file=str(tasks_file)))
+    
+    with TestClient(create_app(KEY, fake_bin, download_dir=str(downloads), tasks_file=str(tasks_file))) as client:
+        def link(task_id, **body):
+            return client.post(f"/api/tasks/{task_id}/link", headers=AUTH, json=body or None)
 
-    def link(task_id, **body):
-        return client.post(f"/api/tasks/{task_id}/link", headers=AUTH, json=body or None)
+        res = link("one", expires_in=3600)
+        data = res.json()["data"]
+        assert res.status_code == 200 and data["expires_at"]
+        url = data["url"].replace("http://testserver", "")
 
-    res = link("one", expires_in=3600)
-    data = res.json()["data"]
-    assert res.status_code == 200 and data["expires_at"]
-    url = data["url"].replace("http://testserver", "")
+        got = client.get(url)
+        assert got.status_code == 200 and got.content == b"0123456789"
+        assert "filename*=utf-8''%E4%B8%AD%E6%96%87%20%E5%90%8D.txt" in got.headers["content-disposition"]
+        part = client.get(url, headers={"Range": "bytes=2-5"})
+        assert part.status_code == 206 and part.content == b"2345"
+        assert client.head(url).status_code == 200
 
-    got = client.get(url)
-    assert got.status_code == 200 and got.content == b"0123456789"
-    assert "filename*=utf-8''%E4%B8%AD%E6%96%87%20%E5%90%8D.txt" in got.headers["content-disposition"]
-    part = client.get(url, headers={"Range": "bytes=2-5"})
-    assert part.status_code == 206 and part.content == b"2345"
-    assert client.head(url).status_code == 200
+        query = dict(p.split("=") for p in url.split("?")[1].split("&"))
+        bad_sig = f"/dl/one?exp={query['exp']}&sig={'0' * 32}"
+        bad_exp = f"/dl/one?exp={int(query['exp']) + 1}&sig={query['sig']}"
+        for bad in (bad_sig, bad_exp, "/dl/one", f"/dl/multi?exp={query['exp']}&sig={query['sig']}"):
+            res = client.get(bad)
+            assert res.status_code == 403 and res.json()["error"]["code"] == "link_invalid", bad
 
-    query = dict(p.split("=") for p in url.split("?")[1].split("&"))
-    bad_sig = f"/dl/one?exp={query['exp']}&sig={'0' * 32}"
-    bad_exp = f"/dl/one?exp={int(query['exp']) + 1}&sig={query['sig']}"
-    for bad in (bad_sig, bad_exp, "/dl/one", f"/dl/multi?exp={query['exp']}&sig={query['sig']}"):
-        res = client.get(bad)
-        assert res.status_code == 403 and res.json()["error"]["code"] == "link_invalid", bad
+        from app.api import _sign
 
-    from app.api import _sign
+        past = int(time.time()) - 10
+        res = client.get(f"/dl/one?exp={past}&sig={_sign(KEY, 'one', past)}")
+        assert res.status_code == 403 and "过期" in res.json()["error"]["message"]
 
-    past = int(time.time()) - 10
-    res = client.get(f"/dl/one?exp={past}&sig={_sign(KEY, 'one', past)}")
-    assert res.status_code == 403 and "过期" in res.json()["error"]["message"]
+        assert link("multi").status_code == 409
+        assert link("running").json()["error"]["code"] == "task_not_ready"
+        assert link("nope").status_code == 404
+        assert link("escape").json()["error"]["code"] == "file_missing"
+        proxied = client.post(
+            "/api/tasks/one/link",
+            headers={**AUTH, "Host": "127.0.0.1:8080", "X-Forwarded-Proto": "https", "X-Forwarded-Host": "pan.example.com, inner"},
+        )
+        assert proxied.json()["data"]["url"].startswith("https://pan.example.com/dl/one?")
+        host_only = client.post("/api/tasks/one/link", headers={**AUTH, "Host": "pan.example.com:8080"})
+        assert host_only.json()["data"]["url"].startswith("http://pan.example.com:8080/dl/one?")
 
-    assert link("multi").status_code == 409
-    assert link("running").json()["error"]["code"] == "task_not_ready"
-    assert link("nope").status_code == 404
-    assert link("escape").json()["error"]["code"] == "file_missing"
-    proxied = client.post(
-        "/api/tasks/one/link",
-        headers={**AUTH, "Host": "127.0.0.1:8080", "X-Forwarded-Proto": "https", "X-Forwarded-Host": "pan.example.com, inner"},
-    )
-    assert proxied.json()["data"]["url"].startswith("https://pan.example.com/dl/one?")
-    host_only = client.post("/api/tasks/one/link", headers={**AUTH, "Host": "pan.example.com:8080"})
-    assert host_only.json()["data"]["url"].startswith("http://pan.example.com:8080/dl/one?")
+        assert link("one", expires_in=10).status_code == 400
+        assert link("one", expires_in=604801).status_code == 400
+        assert client.post("/api/tasks/one/link").status_code == 401
 
-    assert link("one", expires_in=10).status_code == 400
-    assert link("one", expires_in=604801).status_code == 400
-    assert client.post("/api/tasks/one/link").status_code == 401
+        gone_url = link("gone").json()["data"]["url"].replace("http://testserver", "")
+        (downloads / "gone.txt").unlink()
+        res = client.get(gone_url)
+        assert res.status_code == 404 and res.json()["error"]["code"] == "file_missing"
 
-    gone_url = link("gone").json()["data"]["url"].replace("http://testserver", "")
-    (downloads / "gone.txt").unlink()
-    res = client.get(gone_url)
-    assert res.status_code == 404 and res.json()["error"]["code"] == "file_missing"
+        res = client.post("/api/tasks/one/retry", headers=AUTH)
+        assert res.status_code == 409
+
+        res = client.post("/api/tasks/running/retry", headers=AUTH)
+        assert res.status_code == 202
+        data = res.json()["data"]
+        assert data["id"] != "running" and data["status"] == "queued"
+
+        res = client.delete("/api/tasks/one", headers=AUTH)
+        assert res.status_code == 200
+        assert client.get("/api/tasks/one", headers=AUTH).status_code == 404

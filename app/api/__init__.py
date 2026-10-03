@@ -387,6 +387,20 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
             raise ApiError("task_not_found", "任务不存在", 404)
         return _ok(task)
 
+    @api.delete("/tasks/{task_id}")
+    async def delete_task(task_id: str):
+        deleted = await tasks.delete(task_id)
+        if not deleted:
+            raise ApiError("task_not_found", "任务不存在", 404)
+        return _ok(None)
+
+    @api.post("/tasks/{task_id}/retry")
+    async def retry_task(task_id: str):
+        new_task = tasks.retry(task_id)
+        if new_task is None:
+            raise ApiError("task_not_ready", "任务不存在或当前状态不可重试", 409)
+        return _ok(new_task, 202)
+
     @api.post("/tasks/{task_id}/link")
     async def task_link(request: Request, task_id: str, body: Optional[LinkBody] = Body(None)):
         _task_file(tasks, task_id)

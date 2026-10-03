@@ -52,14 +52,18 @@ def _now() -> str:
 
 
 class TaskQueue:
-    def __init__(self, bdpan, download_dir: str, tasks_file: Optional[str] = None):
+    def __init__(self, bdpan, download_dir: str, tasks_file: Optional[str] = None, enable_smart_download: bool = None):
         self.bdpan = bdpan
         self.download_dir = download_dir
         self.tasks_file = tasks_file
+        # 默认启用智能下载，但可以通过参数或环境变量禁用
+        if enable_smart_download is None:
+            enable_smart_download = os.getenv("BAIDU_EASY_SMART_DOWNLOAD", "1") == "1"
+        self.enable_smart_download = enable_smart_download
         self._tasks: dict[str, dict[str, Any]] = {}
-        self._pwds: dict[str, Optional[str]] = {}
         self._queue: Optional[asyncio.Queue] = None
         self._worker: Optional[asyncio.Task] = None
+        self._current: Optional[tuple[str, asyncio.Task]] = None
         self._load()
 
     def _load(self) -> None:
@@ -98,10 +102,38 @@ class TaskQueue:
 
     def submit(self, text: str) -> dict[str, Any]:
         url, pwd = parse_share(text)
+        return self._add(url, pwd)
+
+    def list(self) -> list[dict[str, Any]]:
+        return [dict(t) for t in reversed(self._tasks.values())]
+
+    def get(self, task_id: str) -> Optional[dict[str, Any]]:
+        task = self._tasks.get(task_id)
+        return dict(task) if task else None
+
+    async def delete(self, task_id: str) -> bool:
+        if task_id not in self._tasks:
+            return False
+        current = self._current
+        if current and current[0] == task_id:
+            current[1].cancel()
+            await asyncio.wait({current[1]})
+        self._tasks.pop(task_id, None)
+        self._save()
+        return True
+
+    def retry(self, task_id: str) -> Optional[dict[str, Any]]:
+        task = self._tasks.get(task_id)
+        if task is None or task["status"] not in ("failed", "interrupted"):
+            return None
+        return self._add(task["url"], task.get("pwd"))
+
+    def _add(self, url: str, pwd: Optional[str]) -> dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
         self._tasks[task_id] = {
             "id": task_id,
             "url": url,
+            "pwd": pwd,
             "status": "queued",
             "progress": 0,
             "speed": None,
@@ -115,18 +147,10 @@ class TaskQueue:
             "created_at": _now(),
             "finished_at": None,
         }
-        self._pwds[task_id] = pwd
         self._save()
         self._ensure_worker()
         self._queue.put_nowait(task_id)
         return dict(self._tasks[task_id])
-
-    def list(self) -> list[dict[str, Any]]:
-        return [dict(t) for t in reversed(self._tasks.values())]
-
-    def get(self, task_id: str) -> Optional[dict[str, Any]]:
-        task = self._tasks.get(task_id)
-        return dict(task) if task else None
 
     def _ensure_worker(self) -> None:
         if self._worker is None or self._worker.done():
@@ -139,12 +163,123 @@ class TaskQueue:
     async def _work(self) -> None:
         while True:
             task_id = await self._queue.get()
-            await self._run(self._tasks[task_id])
+            task = self._tasks.get(task_id)
+            if task is None:
+                continue
+            run = asyncio.ensure_future(self._run(task))
+            self._current = (task_id, run)
+            try:
+                await asyncio.wait({run})
+            finally:
+                self._current = None
+                if not run.done():
+                    run.cancel()
 
     async def _run(self, task: dict[str, Any]) -> None:
         task["status"] = "running"
         self._save()
 
+        # 1. 智能下载：先尝试查找网盘中是否已存在该文件
+        if self.enable_smart_download:
+            existing_path = await self._find_existing_in_netdisk(task["url"], task.get("pwd"))
+            
+            if existing_path:
+                # 2. 直接从网盘下载（跳过转存）
+                success = await self._download_from_netdisk(task, existing_path)
+                if success:
+                    return
+
+        # 3. 正常的转存 + 下载流程
+        await self._download_from_share(task)
+
+    async def _find_existing_in_netdisk(self, url: str, pwd: Optional[str]) -> Optional[str]:
+        """在网盘的转存目录中查找是否已存在该文件"""
+        try:
+            # 获取分享链接的文件信息
+            flags = []
+            if pwd:
+                flags += ["-p", pwd]
+            flags += ["--json"]
+            
+            share_list = await self.bdpan.run("transfer", ["list", url] + flags, [])
+            items = share_list.get("items", [])
+            if not items:
+                return None
+            
+            # 只处理单文件情况（多文件/文件夹仍走正常流程）
+            if len(items) != 1 or items[0].get("isdir"):
+                return None
+            
+            file_info = items[0]
+            filename = file_info["server_filename"]
+            filesize = file_info.get("size")
+            
+            # 在网盘的 bdpan 应用目录中搜索
+            search_result = await self.bdpan.run("search", [filename], ["--no-dir", "--json"])
+            
+            for item in search_result.get("items", []):
+                # 文件名和大小都匹配，且在 /apps/bdpan/ 目录下
+                if (item["server_filename"] == filename and 
+                    item.get("size") == filesize and
+                    item["path"].startswith("/apps/bdpan/")):
+                    # 返回相对路径（去掉 /apps/bdpan/ 前缀）
+                    return item["path"].replace("/apps/bdpan/", "")
+            
+            return None
+        except Exception:
+            # 查找失败，继续正常流程
+            return None
+
+    async def _download_from_netdisk(self, task: dict[str, Any], netdisk_path: str) -> bool:
+        """直接从网盘下载（跳过转存）"""
+        tail = ""
+
+        def on_output(text: str) -> None:
+            nonlocal tail
+            text = tail + text
+            for match in _PERCENT_RE.finditer(text):
+                value = min(int(match.group(1)), 99)
+                if value > task["progress"]:
+                    task["progress"] = value
+            stats = None
+            for stats in _STATS_RE.finditer(text):
+                pass
+            if stats:
+                task["downloaded"] = _bytes(stats.group(1), stats.group(2))
+                task["total"] = _bytes(stats.group(3), stats.group(4))
+                task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
+                task["eta"] = _seconds(stats.group(7))
+            tail = re.split(r"[\r\n]", text)[-1][-512:]
+
+        target = os.path.join(self.download_dir, "")
+        try:
+            data = await self.bdpan.run("download", [netdisk_path, target], [], on_output=on_output)
+            task["result"] = data
+            task["status"] = "done"
+            task["progress"] = 100
+            self._fill_result(task, data if isinstance(data, dict) else {})
+            
+            # 添加提示信息
+            if not task.get("error"):
+                task["error"] = {
+                    "code": "skipped_transfer", 
+                    "message": "文件已在网盘中，跳过转存步骤直接下载", 
+                    "errno": None, 
+                    "hint": f"从网盘路径下载：{netdisk_path}"
+                }
+            
+            task["speed"] = None
+            task["eta"] = None
+            task["finished_at"] = _now()
+            self._save()
+            return True
+        except Exception:
+            # 下载失败，返回 False 继续正常流程
+            task["progress"] = 0
+            return False
+
+    async def _download_from_share(self, task: dict[str, Any]) -> None:
+        """正常的转存 + 下载流程"""
         tail = ""
 
         def on_output(text: str) -> None:
@@ -165,7 +300,7 @@ class TaskQueue:
             tail = re.split(r"[\r\n]", text)[-1][-512:]
 
         flags = []
-        pwd = self._pwds.pop(task["id"], None)
+        pwd = task.get("pwd")
         if pwd:
             flags += ["-p", pwd]
         target = os.path.join(self.download_dir, "")

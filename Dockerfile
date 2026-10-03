@@ -40,8 +40,10 @@ ENV BDPAN_CONFIG_DIR=/data/bdpan \
     BAIDU_EASY_TASKS_FILE=/data/tasks.json \
     PYTHONUNBUFFERED=1
 
-USER app
 VOLUME ["/data", "/downloads"]
 EXPOSE 8080
 
-CMD ["python", "-m", "app.main"]
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+CMD ["/usr/local/bin/entrypoint.sh"]

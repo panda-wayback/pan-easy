@@ -69,6 +69,8 @@
   .task-meta dd { margin: 0; color: #cbd5e1; word-break: break-all; }
   .task-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .task-actions button { padding: 3px 10px; font-size: 12px; }
+  .task-actions button.danger { background: var(--danger); color: #fff; }
+  .task-actions button.danger:hover { background: #dc2626; }
   .task-link { font-family: var(--mono); font-size: 12px; flex: 1 1 260px; }
   .task-id { font-family: var(--mono); color: var(--text); user-select: all; }
   .task-error { font-size: 13px; color: var(--danger); word-break: break-all; }
@@ -295,8 +297,10 @@
       if (t.created_at) row("提交时间", new Date(t.created_at).toLocaleString());
       li.appendChild(meta);
 
+      const actions = el("div", "task-actions");
+      let hasActions = false;
+
       if (t.status === "done" && baseName(t.saved_to)) {
-        const actions = el("div", "task-actions");
         const btn = el("button", "secondary", "复制下载链接");
         const out = el("input", "task-link");
         out.type = "text";
@@ -321,8 +325,40 @@
           out.select();
         };
         actions.append(btn, out, note);
-        li.appendChild(actions);
+        hasActions = true;
       }
+
+      if (t.status === "failed" || t.status === "interrupted") {
+        const retryBtn = el("button", "secondary", "重试");
+        retryBtn.onclick = async () => {
+          const data = await call("POST", `/tasks/${t.id}/retry`);
+          if (data.ok) {
+            setMsg("task-msg", true, "已重新提交，新任务 ID：" + data.data.id);
+            loadTasks();
+          } else {
+            setMsg("task-msg", false, errText(data));
+          }
+        };
+        actions.appendChild(retryBtn);
+        hasActions = true;
+      }
+
+      const delBtn = el("button", "danger", "删除");
+      delBtn.onclick = () => {
+        if (!confirm("删除这条任务记录？已下载的文件不会删除。")) return;
+        call("DELETE", `/tasks/${t.id}`).then((data) => {
+          if (data.ok) {
+            setMsg("task-msg", true, "已删除任务 " + t.id);
+            loadTasks();
+          } else {
+            setMsg("task-msg", false, errText(data));
+          }
+        });
+      };
+      actions.appendChild(delBtn);
+      hasActions = true;
+
+      if (hasActions) li.appendChild(actions);
 
       if (t.error) {
         const e = t.error;

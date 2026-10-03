@@ -59,6 +59,12 @@ input:
   - name: POST /api/tasks/{id}/link
     type: path id；JSON {expires_in?} 可省略
     desc: 生成下载链接；expires_in 为秒，60-604800，默认 86400；返回 {url, expires_at}
+  - name: POST /api/tasks/{id}/retry
+    type: path id
+    desc: 重试失败或中断的任务；创建新任务并返回 202 与任务对象
+  - name: DELETE /api/tasks/{id}
+    type: path id
+    desc: 删除任务记录；运行中的任务会先取消，已下载的文件保留
   - name: GET|HEAD /dl/{id}
     type: path id；query exp, sig
     desc: 用下载链接下载任务文件；不需要访问密钥，凭签名与有效期放行
@@ -97,7 +103,7 @@ errors:
   - code: task_not_found
     desc: 任务不存在；HTTP 404
   - code: task_not_ready
-    desc: 任务未完成或包含多个文件，不能生成下载链接；HTTP 409
+    desc: 任务未完成、包含多个文件或状态不可重试；HTTP 409
   - code: file_missing
     desc: 任务文件已不在下载目录；HTTP 404
   - code: link_invalid
@@ -128,3 +134,5 @@ tests:
   - 适配器各类错误到 HTTP 状态码与 error.code 的映射
   - 任务接口：提交返回 202；文字无链接返回 400；列表新任务在前；未知任务返回 404
   - 下载链接：完成的单文件任务生成链接后不带密钥可下载且内容一致；Range 请求返回 206；改动 sig 或 exp、过期返回 403；未完成或多文件返回 409；文件被删返回 404；expires_in 越界返回 400；带 X-Forwarded-Proto/Host 时链接使用转发的协议与域名
+  - 删除任务：不存在返回 404；运行中删除返回 202；已结束删除返回 200；删除后按 ID 查询返回 404
+  - 重试任务：失败/中断任务返回 202 且新任务在最前；已完成或运行中返回 409；不可重试返回 409；正在运行中删除返回 202
