@@ -31,9 +31,15 @@ def parse_share(text: str) -> tuple[str, Optional[str]]:
     url = match.group(0)
     pwd = (parse_qs(urlsplit(url).query).get("pwd") or [None])[0]
     if pwd:
-        return url, None
+        return url, pwd
     text_pwd = _PWD_TEXT_RE.search(text)
-    return url, text_pwd.group(1) if text_pwd else None
+    if text_pwd:
+        pwd_value = text_pwd.group(1)
+        # 将提取码附加到 URL 中，统一格式
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}pwd={pwd_value}"
+        pwd = pwd_value
+    return url, pwd
 
 
 def _bytes(number: str, unit: str) -> int:

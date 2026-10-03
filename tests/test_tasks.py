@@ -14,11 +14,11 @@ SAMPLE = """https://pan.baidu.com/s/1gN_JChf4vaDURH-mB4AWRQ?pwd=PhPR
 @pytest.mark.parametrize(
     "text, url, pwd",
     [
-        (SAMPLE, "https://pan.baidu.com/s/1gN_JChf4vaDURH-mB4AWRQ?pwd=PhPR", None),
-        ("链接: https://pan.baidu.com/s/1abc 提取码: x9Yz 复制", "https://pan.baidu.com/s/1abc", "x9Yz"),
-        ("链接：https://pan.baidu.com/s/1abc?pwd=aaaa 提取码：bbbb", "https://pan.baidu.com/s/1abc?pwd=aaaa", None),
+        (SAMPLE, "https://pan.baidu.com/s/1gN_JChf4vaDURH-mB4AWRQ?pwd=PhPR", "PhPR"),
+        ("链接: https://pan.baidu.com/s/1abc 提取码: x9Yz 复制", "https://pan.baidu.com/s/1abc?pwd=x9Yz", "x9Yz"),
+        ("链接：https://pan.baidu.com/s/1abc?pwd=aaaa 提取码：bbbb", "https://pan.baidu.com/s/1abc?pwd=aaaa", "aaaa"),
         ("https://pan.baidu.com/s/1abc", "https://pan.baidu.com/s/1abc", None),
-        ("链接：https://pan.baidu.com/s/1abc?pwd=PhPR复制这段内容", "https://pan.baidu.com/s/1abc?pwd=PhPR", None),
+        ("链接：https://pan.baidu.com/s/1abc?pwd=PhPR复制这段内容", "https://pan.baidu.com/s/1abc?pwd=PhPR", "PhPR"),
     ],
 )
 def test_parse_share(text, url, pwd):
@@ -78,8 +78,8 @@ def test_tasks_run_in_order_one_at_a_time(tmp_path):
     a, b = asyncio.run(scenario())
     assert bdpan.max_active == 1
     assert bdpan.calls == [
-        ("download", ["https://pan.baidu.com/s/1aaa?pwd=1111", str(tmp_path) + "/"], []),
-        ("download", ["https://pan.baidu.com/s/1bbb", str(tmp_path) + "/"], ["-p", "2222"]),
+        ("download", ["https://pan.baidu.com/s/1aaa?pwd=1111", str(tmp_path) + "/"], ["-p", "1111"]),
+        ("download", ["https://pan.baidu.com/s/1bbb?pwd=2222", str(tmp_path) + "/"], ["-p", "2222"]),
     ]
     assert queue.get(a["id"])["saved_to"] == "a.zip"
     assert queue.get(b["id"])["status"] == "done"
