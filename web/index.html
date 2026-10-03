@@ -368,9 +368,13 @@
       if (t.status === "failed" || t.status === "interrupted") {
         const retryBtn = el("button", "secondary", "重试");
         retryBtn.onclick = async () => {
+          retryBtn.disabled = true;
+          retryBtn.textContent = "重试中...";
           const data = await call("POST", `/tasks/${t.id}/retry`);
+          retryBtn.disabled = false;
+          retryBtn.textContent = "重试";
           if (data.ok) {
-            setMsg("task-msg", true, "已重新提交，新任务 ID：" + data.data.id);
+            setMsg("task-msg", true, "任务已重新开始：" + data.data.id);
             loadTasks();
           } else {
             setMsg("task-msg", false, errText(data));

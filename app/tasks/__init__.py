@@ -129,10 +129,28 @@ class TaskQueue:
         return True
 
     def retry(self, task_id: str) -> Optional[dict[str, Any]]:
+        """重试失败或中断的任务（恢复原任务，支持断点续传）"""
         task = self._tasks.get(task_id)
         if task is None or task["status"] not in ("failed", "interrupted"):
             return None
-        return self._add(task["url"], task.get("pwd"))
+        
+        # 重置任务状态，保留任务 ID
+        task.update(
+            status="queued",
+            progress=0,
+            speed=None,
+            eta=None,
+            error=None,
+            finished_at=None,
+            will_skip_transfer=None,  # 重置智能下载标记
+        )
+        # 注意：不重置 downloaded, total - 保留下载进度信息
+        # 不重置 saved_to - 保留目标路径，bdpan 可能检测部分文件
+        
+        self._save()
+        self._ensure_worker()
+        self._queue.put_nowait(task_id)
+        return dict(task)
 
     def _add(self, url: str, pwd: Optional[str]) -> dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
