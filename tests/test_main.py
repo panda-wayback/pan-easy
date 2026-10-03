@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -93,4 +94,72 @@ def _combined_flow(client, work, downloads):
     assert task["pan_path"] == "我的应用数据/bdpan/2026-10-03/shared.bin"
     assert (downloads / "shared.bin").read_bytes() == b"shared-content"
 
+    res = client.post(f"/api/tasks/{task_id}/link", headers=AUTH)
+    assert res.status_code == 200
+    url = res.json()["data"]["url"]
+    assert url.startswith(f"http://testserver/dl/{task_id}?") and KEY not in url
+    assert client.get(url).content == b"shared-content"
+
     assert list(work.iterdir()) == []
+
+
+def _task(task_id, status="done", saved_to=None):
+    return {"id": task_id, "url": "https://pan.baidu.com/s/1x", "status": status, "progress": 100, "saved_to": saved_to}
+
+
+def test_download_link(fake_bin, tmp_path):
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    (downloads / "中文 名.txt").write_bytes(b"0123456789")
+    (downloads / "gone.txt").write_bytes(b"x")
+    tasks_file = tmp_path / "tasks.json"
+    tasks = [
+        _task("one", saved_to="中文 名.txt"),
+        _task("multi", saved_to="."),
+        _task("running", status="failed"),
+        _task("gone", saved_to="gone.txt"),
+        _task("escape", saved_to="../tasks.json"),
+    ]
+    tasks_file.write_text(json.dumps(tasks), encoding="utf-8")
+    client = TestClient(create_app(KEY, fake_bin, download_dir=str(downloads), tasks_file=str(tasks_file)))
+
+    def link(task_id, **body):
+        return client.post(f"/api/tasks/{task_id}/link", headers=AUTH, json=body or None)
+
+    res = link("one", expires_in=3600)
+    data = res.json()["data"]
+    assert res.status_code == 200 and data["expires_at"]
+    url = data["url"].replace("http://testserver", "")
+
+    got = client.get(url)
+    assert got.status_code == 200 and got.content == b"0123456789"
+    assert "filename*=utf-8''%E4%B8%AD%E6%96%87%20%E5%90%8D.txt" in got.headers["content-disposition"]
+    part = client.get(url, headers={"Range": "bytes=2-5"})
+    assert part.status_code == 206 and part.content == b"2345"
+    assert client.head(url).status_code == 200
+
+    query = dict(p.split("=") for p in url.split("?")[1].split("&"))
+    bad_sig = f"/dl/one?exp={query['exp']}&sig={'0' * 32}"
+    bad_exp = f"/dl/one?exp={int(query['exp']) + 1}&sig={query['sig']}"
+    for bad in (bad_sig, bad_exp, "/dl/one", f"/dl/multi?exp={query['exp']}&sig={query['sig']}"):
+        res = client.get(bad)
+        assert res.status_code == 403 and res.json()["error"]["code"] == "link_invalid", bad
+
+    from app.api import _sign
+
+    past = int(time.time()) - 10
+    res = client.get(f"/dl/one?exp={past}&sig={_sign(KEY, 'one', past)}")
+    assert res.status_code == 403 and "过期" in res.json()["error"]["message"]
+
+    assert link("multi").status_code == 409
+    assert link("running").json()["error"]["code"] == "task_not_ready"
+    assert link("nope").status_code == 404
+    assert link("escape").json()["error"]["code"] == "file_missing"
+    assert link("one", expires_in=10).status_code == 400
+    assert link("one", expires_in=604801).status_code == 400
+    assert client.post("/api/tasks/one/link").status_code == 401
+
+    gone_url = link("gone").json()["data"]["url"].replace("http://testserver", "")
+    (downloads / "gone.txt").unlink()
+    res = client.get(gone_url)
+    assert res.status_code == 404 and res.json()["error"]["code"] == "file_missing"

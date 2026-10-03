@@ -64,7 +64,13 @@
   .task-progress { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
   .bar { flex: 1 1 200px; height: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
   .bar > div { height: 100%; background: var(--accent); transition: width 300ms; }
-  .task-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--muted); word-break: break-all; }
+  .task-meta { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; font-size: 12px; color: var(--muted); }
+  .task-meta dt { white-space: nowrap; }
+  .task-meta dd { margin: 0; color: #cbd5e1; word-break: break-all; }
+  .task-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .task-actions button { padding: 3px 10px; font-size: 12px; }
+  .task-link { font-family: var(--mono); font-size: 12px; flex: 1 1 260px; }
+  .task-id { font-family: var(--mono); color: var(--text); user-select: all; }
   .task-error { font-size: 13px; color: var(--danger); word-break: break-all; }
   [hidden] { display: none !important; }
   @media (max-width: 768px) {
@@ -232,6 +238,7 @@
 
   const TASK_STATUS = { queued: "排队中", running: "下载中", done: "完成", failed: "失败", submitted: "转存已提交，尚未完成" };
   let taskTimer = null;
+  const links = {};
   const fmtBytes = (n) => {
     const units = ["B", "kB", "MB", "GB", "TB"];
     let i = 0;
@@ -276,12 +283,46 @@
       prog.appendChild(el("span", "", parts.join(" · ")));
       li.appendChild(prog);
 
-      const meta = el("div", "task-meta");
-      if (t.saved_to) meta.appendChild(el("span", "", "服务器：downloads/" + (t.saved_to === "." ? "" : t.saved_to)));
-      if (t.pan_path) meta.appendChild(el("span", "", "网盘：" + t.pan_path));
-      if (baseName(t.saved_to) || baseName(t.pan_path)) meta.appendChild(el("span", "", "链接：" + t.url));
-      if (t.created_at) meta.appendChild(el("span", "", "提交：" + new Date(t.created_at).toLocaleString()));
+      const meta = el("dl", "task-meta");
+      const row = (label, value, cls) => {
+        meta.appendChild(el("dt", "", label));
+        meta.appendChild(el("dd", cls || "", value));
+      };
+      row("任务 ID", t.id, "task-id");
+      if (t.saved_to) row("服务器", "downloads/" + (t.saved_to === "." ? "" : t.saved_to));
+      if (t.pan_path) row("网盘", t.pan_path);
+      if (baseName(t.saved_to) || baseName(t.pan_path)) row("分享链接", t.url);
+      if (t.created_at) row("提交时间", new Date(t.created_at).toLocaleString());
       li.appendChild(meta);
+
+      if (t.status === "done" && baseName(t.saved_to)) {
+        const actions = el("div", "task-actions");
+        const btn = el("button", "secondary", "复制下载链接");
+        const out = el("input", "task-link");
+        out.type = "text";
+        out.readOnly = true;
+        out.hidden = true;
+        const note = el("span", "msg");
+        const show = (saved) => {
+          out.value = saved.url;
+          out.hidden = false;
+          note.className = "msg ok";
+          note.textContent = saved.note;
+        };
+        if (links[t.id]) show(links[t.id]);
+        btn.onclick = async () => {
+          const data = await call("POST", `/tasks/${t.id}/link`);
+          if (!data.ok) { note.className = "msg err"; note.textContent = errText(data); return; }
+          let copied = false;
+          try { await navigator.clipboard.writeText(data.data.url); copied = true; } catch (e) {}
+          const expires = new Date(data.data.expires_at).toLocaleString();
+          links[t.id] = { url: data.data.url, note: (copied ? "已复制，" : "请手动复制，") + "有效期至 " + expires };
+          show(links[t.id]);
+          out.select();
+        };
+        actions.append(btn, out, note);
+        li.appendChild(actions);
+      }
 
       if (t.error) {
         const e = t.error;

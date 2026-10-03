@@ -1,17 +1,21 @@
 import asyncio
+import hashlib
 import hmac
+import os
 import posixpath
 import re
 import shutil
 import tempfile
+import time
 from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Literal, Optional
 
-from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.bdpan import Bdpan, BdpanError
@@ -68,6 +72,28 @@ def _check_paths(values: list[str], field: str) -> list[str]:
     if not values:
         raise _invalid(f"{field} 不能为空")
     return [_check_path(v, field) for v in values]
+
+
+def _sign(api_key: str, task_id: str, exp: int) -> str:
+    return hmac.new(api_key.encode(), f"{task_id}.{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def _task_file(tasks: TaskQueue, task_id: str) -> Path:
+    task = tasks.get(task_id)
+    if task is None:
+        raise ApiError("task_not_found", "任务不存在", 404)
+    if task["status"] != "done":
+        raise ApiError("task_not_ready", "任务尚未完成，不能生成下载链接", 409)
+    saved_to = task.get("saved_to")
+    if not saved_to or saved_to == ".":
+        raise ApiError("task_not_ready", "任务包含多个文件，暂不支持生成下载链接", 409)
+    root = os.path.realpath(tasks.download_dir)
+    path = os.path.realpath(os.path.join(root, saved_to))
+    if not path.startswith(root + os.sep):
+        raise ApiError("file_missing", "任务文件不在下载目录内", 404)
+    if not os.path.isfile(path):
+        raise ApiError("file_missing", "任务文件已不在下载目录中", 404)
+    return Path(path)
 
 
 class _ApiKeyMiddleware:
@@ -156,6 +182,10 @@ class PathsBody(BaseModel):
 
 class TaskBody(BaseModel):
     text: str
+
+
+class LinkBody(BaseModel):
+    expires_in: int = Field(86400, ge=60, le=604800)
 
 
 def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[str] = None) -> FastAPI:
@@ -346,4 +376,35 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
             raise ApiError("task_not_found", "任务不存在", 404)
         return _ok(task)
 
+    @api.post("/tasks/{task_id}/link")
+    async def task_link(request: Request, task_id: str, body: Optional[LinkBody] = Body(None)):
+        _task_file(tasks, task_id)
+        exp = int(time.time()) + (body or LinkBody()).expires_in
+        url = f"{request.url.scheme}://{request.url.netloc}/dl/{task_id}?exp={exp}&sig={_sign(api_key, task_id, exp)}"
+        expires_at = datetime.fromtimestamp(exp, timezone.utc).astimezone().isoformat(timespec="seconds")
+        return _ok({"url": url, "expires_at": expires_at})
+
     return api
+
+
+def create_dl(api_key: str, tasks: TaskQueue) -> FastAPI:
+    dl = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+    @dl.exception_handler(ApiError)
+    async def _api_error(_: Request, err: ApiError):
+        return _error_response(err.code, err.message, err.status, err.errno)
+
+    @dl.exception_handler(RequestValidationError)
+    async def _validation_error(_: Request, err: RequestValidationError):
+        return _error_response("link_invalid", "下载链接不完整", 403)
+
+    @dl.api_route("/{task_id}", methods=["GET", "HEAD"])
+    async def download_link(task_id: str, exp: int, sig: str):
+        if not hmac.compare_digest(sig.encode(), _sign(api_key, task_id, exp).encode()):
+            raise ApiError("link_invalid", "下载链接无效", 403)
+        if exp < time.time():
+            raise ApiError("link_invalid", "下载链接已过期，请重新生成", 403)
+        path = _task_file(tasks, task_id)
+        return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+    return dl

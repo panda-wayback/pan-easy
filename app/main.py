@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
-from app.api import create_api
+from app.api import create_api, create_dl
 from app.bdpan import Bdpan
 from app.tasks import TaskQueue
 
@@ -28,7 +28,9 @@ def create_app(
 
     os.makedirs(download_dir, exist_ok=True)
     bdpan = Bdpan(bdpan_bin)
-    app.mount("/api", create_api(bdpan, api_key, TaskQueue(bdpan, download_dir, tasks_file), tmp_dir))
+    tasks = TaskQueue(bdpan, download_dir, tasks_file)
+    app.mount("/api", create_api(bdpan, api_key, tasks, tmp_dir))
+    app.mount("/dl", create_dl(api_key, tasks))
     return app
 
 

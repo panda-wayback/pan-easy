@@ -4,7 +4,7 @@ modules: []
 input:
   - name: Authorization
     type: header "Bearer <key>"
-    desc: 访问密钥；所有 /api/* 必填
+    desc: 访问密钥；所有 /api/* 必填（/dl 不需要）
   - name: GET /api/status
     type: 无参数
     desc: 查看登录状态
@@ -56,6 +56,12 @@ input:
   - name: GET /api/tasks/{id}
     type: path id
     desc: 单个任务
+  - name: POST /api/tasks/{id}/link
+    type: path id；JSON {expires_in?} 可省略
+    desc: 生成下载链接；expires_in 为秒，60-604800，默认 86400；返回 {url, expires_at}
+  - name: GET|HEAD /dl/{id}
+    type: path id；query exp, sig
+    desc: 用下载链接下载任务文件；不需要访问密钥，凭签名与有效期放行
 output:
   - name: success
     type: JSON {ok:true, data}
@@ -69,6 +75,9 @@ output:
   - name: download
     type: application/octet-stream
     desc: 下载成功时返回文件流，带 Content-Disposition 文件名
+  - name: link_download
+    type: application/octet-stream
+    desc: /dl/{id} 返回下载目录中的任务文件，支持 Range 断点续传，文件名为原始文件名
 contract:
   - 所有 /api/* 校验访问密钥，比较使用常量时间
   - 网盘路径均为相对 我的应用数据/bdpan 的相对路径；含 .. 或以 /、~ 开头时拒绝
@@ -77,12 +86,22 @@ contract:
   - 下载目标为目录时拒绝
   - 转存未完成时返回 202 与任务 ID，不返回 ok 完成态
   - 响应中不出现 Token、配置内容与授权码
+  - 下载链接：sig 为以访问密钥为密钥对“任务 ID 与 exp”计算的 HMAC-SHA256；校验用常量时间比较；exp 过期或 sig 不符时拒绝；访问密钥不出现在链接中；更换访问密钥后旧链接全部失效
+  - 链接地址取生成请求的协议与主机
+  - 只对状态为 done 且 saved_to 为单个文件的任务生成链接与提供下载
+  - /dl 只读取下载目录内的文件；解析后的路径不在下载目录内时拒绝
 depends:
   - app/bdpan
   - app/tasks
 errors:
   - code: task_not_found
     desc: 任务不存在；HTTP 404
+  - code: task_not_ready
+    desc: 任务未完成或包含多个文件，不能生成下载链接；HTTP 409
+  - code: file_missing
+    desc: 任务文件已不在下载目录；HTTP 404
+  - code: link_invalid
+    desc: 下载链接签名不符或已过期；HTTP 403
   - code: unauthorized
     desc: 缺少或错误的访问密钥；HTTP 401
   - code: invalid_argument
@@ -108,3 +127,4 @@ tests:
   - 转存 submitted 返回 202 与任务 ID
   - 适配器各类错误到 HTTP 状态码与 error.code 的映射
   - 任务接口：提交返回 202；文字无链接返回 400；列表新任务在前；未知任务返回 404
+  - 下载链接：完成的单文件任务生成链接后不带密钥可下载且内容一致；Range 请求返回 206；改动 sig 或 exp、过期返回 403；未完成或多文件返回 409；文件被删返回 404；expires_in 越界返回 400

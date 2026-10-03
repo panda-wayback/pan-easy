@@ -34,7 +34,7 @@ input:
 output:
   - name: http
     type: HTTP service
-    desc: 在监听地址上提供 /api/* 接口与测试网页 /
+    desc: 在监听地址上提供 /api/* 接口、下载链接 /dl/* 与测试网页 /
   - name: image
     type: Docker image
     desc: 包含服务程序与固定版本 bdpan 的镜像
