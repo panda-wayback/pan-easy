@@ -11,24 +11,28 @@ input:
   - name: stdin
     type: bytes, optional
     desc: 标准输入内容；仅 login 提交授权码时使用
-  - name: ctx
-    type: context
-    desc: 调用方上下文；取消时终止 bdpan 进程
+  - name: cancel
+    type: 调用方取消信号
+    desc: 取消时终止 bdpan 进程
+  - name: on_output
+    type: callback(str), optional
+    desc: 运行过程中逐段转交 bdpan 标准输出与标准错误原文（下载进度条在标准错误）
 output:
   - name: result
     type: JSON object
     desc: bdpan --json 输出解析结果
   - name: error
-    type: Error{kind, errno, message}
-    desc: 归一化错误；kind 取值见 errors
+    type: Error{kind, errno, message, hint}
+    desc: 归一化错误；kind 取值见 errors；hint 为常见错误码的中文说明，未知错误码为空
 contract:
   - 子命令不在白名单内时直接返回错误，不启动进程
   - 参数以进程参数数组传递，不经过 shell
   - 每次调用附加 --json 与 --no-check-update
-  - whoami / ls / search / mkdir / mv / cp / rename / rm / share 超时 60 秒；login 超时 30 秒；upload / download / transfer 只受 ctx 控制
+  - whoami / ls / search / mkdir / mv / cp / rename / rm / share 超时 60 秒；login 超时 30 秒；upload / download / transfer 只受取消信号控制
   - 不读取、不输出 bdpan 配置文件与 Token；返回结果与错误信息中不包含授权码
   - 授权码只通过 stdin 传给 bdpan，不出现在进程参数中
   - errno 与 message 原样保留 bdpan 返回值
+  - 已知错误码（13003 / 13004 / 13045 / 13070 / 13071 / 13072 / 13073）附中文说明 hint
 depends:
   - ext:bdpan-cli
 errors:
@@ -46,6 +50,7 @@ errors:
     desc: 子命令不在白名单
 tests:
   - 用假 bdpan 脚本返回预设 JSON 与错误，验证参数拼装（含 --json、--no-check-update）
-  - 验证未登录、Token 失效、业务错误的归一化与 errno 保留
-  - 验证超时终止进程、ctx 取消终止进程
+  - 验证未登录、Token 失效、业务错误的归一化与 errno 保留；已知错误码带 hint，未知错误码无 hint
+  - 验证超时终止进程、取消信号终止进程
   - 验证白名单外子命令不启动进程；授权码不出现在进程参数与错误信息中
+  - 验证 on_output 在进程运行期间收到输出，且最终结果解析不受影响

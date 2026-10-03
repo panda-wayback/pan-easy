@@ -1,0 +1,6 @@
+*
+!app/
+!web/
+!requirements.txt
+**/__pycache__
+**/spec.yaml

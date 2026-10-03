@@ -47,6 +47,15 @@ input:
   - name: POST /api/rm
     type: JSON {paths:[string]}
     desc: 删除
+  - name: POST /api/tasks
+    type: JSON {text}
+    desc: 提交分享文字，创建后台下载任务；返回 202 与任务对象
+  - name: GET /api/tasks
+    type: 无参数
+    desc: 任务列表，新任务在前
+  - name: GET /api/tasks/{id}
+    type: path id
+    desc: 单个任务
 output:
   - name: success
     type: JSON {ok:true, data}
@@ -55,8 +64,8 @@ output:
     type: HTTP 202 JSON {ok:true, data:{status:"submitted", task_id, ...}}
     desc: 转存任务已提交但未完成
   - name: failure
-    type: JSON {ok:false, error:{code, message, errno?}}
-    desc: code 取值见 errors
+    type: JSON {ok:false, error:{code, message, errno?, hint?}}
+    desc: code 取值见 errors；hint 为适配层给出的中文说明
   - name: download
     type: application/octet-stream
     desc: 下载成功时返回文件流，带 Content-Disposition 文件名
@@ -69,8 +78,11 @@ contract:
   - 转存未完成时返回 202 与任务 ID，不返回 ok 完成态
   - 响应中不出现 Token、配置内容与授权码
 depends:
-  - internal/bdpan
+  - app/bdpan
+  - app/tasks
 errors:
+  - code: task_not_found
+    desc: 任务不存在；HTTP 404
   - code: unauthorized
     desc: 缺少或错误的访问密钥；HTTP 401
   - code: invalid_argument
@@ -95,3 +107,4 @@ tests:
   - 上传、下载在成功、失败、客户端断开三种情况下临时文件都被删除
   - 转存 submitted 返回 202 与任务 ID
   - 适配器各类错误到 HTTP 状态码与 error.code 的映射
+  - 任务接口：提交返回 202；文字无链接返回 400；列表新任务在前；未知任务返回 404

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>baidu-easy</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --line: #334155; --text: #f8fafc; --muted: #94a3b8;
+    --accent: #22c55e; --accent-hover: #16a34a; --danger: #ef4444; --warn: #f59e0b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 16px 12px; position: sticky; top: 0; height: 100vh; }
+  .brand { font-size: 18px; font-weight: 700; padding: 4px 10px 16px; }
+  nav { display: flex; flex-direction: column; gap: 4px; }
+  nav a { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; transition: background-color 150ms, color 150ms; }
+  nav a:hover { background: var(--line); color: var(--text); }
+  nav a[aria-current="page"] { background: rgba(34, 197, 94, 0.12); color: var(--accent); font-weight: 600; }
+  nav svg { width: 18px; height: 18px; flex: none; }
+  .side-status { margin-top: auto; padding: 10px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; word-break: break-all; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--accent); }
+  .dot.err { background: var(--danger); }
+  main { padding: 24px; max-width: 1200px; width: 100%; }
+  main h1 { margin: 0 0 16px; font-size: 20px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  h2 { margin: 0 0 10px; font-size: 15px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  .row:last-child { margin-bottom: 0; }
+  label { color: var(--muted); }
+  input[type=text], input[type=password], textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; min-width: 0; flex: 1 1 180px;
+  }
+  textarea { font-family: var(--mono); min-height: 96px; }
+  button { background: var(--accent); color: #052e16; border: 0; border-radius: 6px; padding: 6px 12px; font: inherit; font-weight: 600; cursor: pointer; transition: background-color 150ms; }
+  button:hover { background: var(--accent-hover); }
+  button.secondary { background: var(--line); color: var(--text); }
+  button.secondary:hover { background: #475569; }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  a { color: #4ade80; }
+  .muted { color: var(--muted); }
+  .msg { font-size: 13px; color: var(--muted); }
+  .msg:empty { display: none; }
+  .msg.ok { color: var(--accent); }
+  .msg.err { color: var(--danger); }
+  .tip { border-left: 3px solid var(--warn); padding: 8px 12px; background: rgba(245, 158, 11, 0.08); margin-bottom: 16px; border-radius: 0 6px 6px 0; }
+  .notice { border-left: 3px solid var(--warn); padding: 6px 10px; background: rgba(245, 158, 11, 0.08); margin-bottom: 8px; }
+  .notice ol { margin: 4px 0; padding-left: 20px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin-bottom: 8px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; }
+  .tasks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  .task { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+  .task-head { display: flex; align-items: flex-start; gap: 12px; }
+  .task-title { flex: 1; font-weight: 600; word-break: break-all; }
+  .badge { flex: none; font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; color: var(--muted); }
+  .badge.st-running { color: #38bdf8; }
+  .badge.st-done { color: var(--accent); }
+  .badge.st-failed { color: var(--danger); }
+  .badge.st-submitted { color: var(--warn); }
+  .task-progress { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+  .bar { flex: 1 1 200px; height: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--accent); transition: width 300ms; }
+  .task-meta { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12px; color: var(--muted); word-break: break-all; }
+  .task-error { font-size: 13px; color: var(--danger); word-break: break-all; }
+  [hidden] { display: none !important; }
+  @media (max-width: 768px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; border-right: 0; border-bottom: 1px solid var(--line); padding: 8px 12px; }
+    .brand { padding: 4px 8px; }
+    nav { flex-direction: row; }
+    .side-status { margin: 0 0 0 auto; border-top: 0; padding: 4px 8px; }
+    main { padding: 16px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <div class="brand">baidu-easy</div>
+    <nav>
+      <a href="#download" data-page="download">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        下载
+      </a>
+      <a href="#login" data-page="login">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+        登录
+      </a>
+    </nav>
+    <div class="side-status"><span class="dot" id="side-dot"></span><span id="side-text">查询中…</span></div>
+  </aside>
+
+  <main>
+    <div id="page-download">
+      <h1>下载</h1>
+      <div class="tip" id="key-tip" hidden>还没有设置访问密钥，请先到 <a href="#login">登录页</a> 设置。</div>
+      <section>
+        <h2>粘贴分享文字</h2>
+        <div class="muted" style="margin-bottom:8px">把百度网盘的分享文字整段粘贴进来，文件会在后台下载到服务器的下载目录（项目下的 downloads/）。</div>
+        <div class="row">
+          <textarea id="task-text" placeholder="例如：&#10;通过百度网盘分享的文件：xxx.zip&#10;链接：https://pan.baidu.com/s/xxxx?pwd=abcd&#10;复制这段内容打开「百度网盘APP 即可获取」"></textarea>
+        </div>
+        <div class="row">
+          <button id="task-btn">开始下载</button>
+          <button class="secondary" id="task-refresh">刷新任务</button>
+        </div>
+        <div class="msg" id="task-msg"></div>
+      </section>
+      <section>
+        <h2>下载任务</h2>
+        <div id="task-list"><div class="muted">还没有下载任务</div></div>
+      </section>
+    </div>
+
+    <div id="page-login" hidden>
+      <h1>登录</h1>
+      <section>
+        <h2>访问密钥</h2>
+        <div class="row">
+          <input type="password" id="key" placeholder="启动服务时设置的 BAIDU_EASY_API_KEY" autocomplete="off">
+          <button id="key-save">保存</button>
+          <button class="secondary" id="key-clear">清除</button>
+        </div>
+        <div class="msg" id="key-msg"></div>
+      </section>
+
+      <section>
+        <h2>登录状态</h2>
+        <dl class="kv">
+          <dt>状态</dt><dd id="st-state">-</dd>
+          <dt>用户名</dt><dd id="st-user">-</dd>
+          <dt>有效期至</dt><dd id="st-expires">-</dd>
+        </dl>
+        <div class="row"><button class="secondary" id="status-btn">刷新状态</button></div>
+        <div class="msg" id="status-msg"></div>
+      </section>
+
+      <section>
+        <h2>授权登录</h2>
+        <div class="notice">
+          <strong>bdpan 安全须知</strong>
+          <ol>
+            <li>请备份网盘重要数据，谨慎操作。</li>
+            <li>AI Agent 行为具有不可预测性，请实时人工审核指令执行过程，对执行后果负责。</li>
+            <li>严禁在他人、公用或不可信的环境中扫码授权；公共环境使用完毕后请清除授权。</li>
+            <li>请严格保护配置文件与 Token，切勿在公开仓库或对话中暴露。</li>
+          </ol>
+          <label><input type="checkbox" id="accept"> 我已阅读并认可上述条款</label>
+        </div>
+        <div class="row">
+          <button id="login-url-btn">获取授权链接</button>
+          <span id="login-url"></span>
+        </div>
+        <div class="row">
+          <input type="text" id="auth-code" placeholder="浏览器中显示的 32 位授权码" autocomplete="off">
+          <button id="login-code-btn">提交授权码</button>
+        </div>
+        <div class="msg" id="login-msg"></div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script>
+(() => {
+  const KEY_STORE = "baidu-easy-key";
+  const $ = (id) => document.getElementById(id);
+  const getKey = () => localStorage.getItem(KEY_STORE) || "";
+
+  function setMsg(id, ok, text) {
+    $(id).className = "msg " + (ok ? "ok" : "err");
+    $(id).textContent = text;
+  }
+
+  const errText = (data) => {
+    const err = (data && data.error) || {};
+    return `${err.hint || err.message || "请求失败"}（${err.code || "error"}）`;
+  };
+
+  async function call(method, path, json) {
+    const headers = { Authorization: "Bearer " + getKey() };
+    let body;
+    if (json !== undefined) {
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify(json);
+    }
+    try {
+      const res = await fetch("/api" + path, { method, headers, body });
+      return await res.json();
+    } catch (e) {
+      return { ok: false, error: { code: "network", message: String(e) } };
+    }
+  }
+
+  function setSide(state, text) {
+    $("side-dot").className = "dot" + (state ? " " + state : "");
+    $("side-text").textContent = text;
+  }
+
+  async function refreshStatus(showMsg) {
+    if (!getKey()) {
+      setSide("", "未设置访问密钥");
+      $("st-state").textContent = "未设置访问密钥";
+      $("st-user").textContent = $("st-expires").textContent = "-";
+      return;
+    }
+    const data = await call("GET", "/status");
+    if (!data.ok) {
+      setSide("err", data.error && data.error.code === "unauthorized" ? "访问密钥无效" : "状态查询失败");
+      $("st-state").textContent = "查询失败";
+      if (showMsg) setMsg("status-msg", false, errText(data));
+      return;
+    }
+    const d = data.data || {};
+    if (d.authenticated) {
+      setSide("ok", "已登录：" + (d.username || ""));
+      $("st-state").textContent = "已登录";
+      $("st-user").textContent = d.username || "-";
+      $("st-expires").textContent = d.expires_at ? new Date(d.expires_at).toLocaleString() : "-";
+    } else {
+      setSide("err", "未登录");
+      $("st-state").textContent = "未登录";
+      $("st-user").textContent = $("st-expires").textContent = "-";
+    }
+    if (showMsg) setMsg("status-msg", true, "已刷新");
+  }
+
+  const TASK_STATUS = { queued: "排队中", running: "下载中", done: "完成", failed: "失败", submitted: "转存已提交，尚未完成" };
+  let taskTimer = null;
+  const fmtBytes = (n) => {
+    const units = ["B", "kB", "MB", "GB", "TB"];
+    let i = 0;
+    while (n >= 1000 && i < units.length - 1) { n /= 1000; i++; }
+    return (i ? n.toFixed(1) : n) + " " + units[i];
+  };
+  const fmtEta = (s) => (s >= 3600 ? `${Math.floor(s / 3600)}小时${Math.floor((s % 3600) / 60)}分` : s >= 60 ? `${Math.floor(s / 60)}分${s % 60}秒` : `${s}秒`);
+
+  function renderTasks(tasks) {
+    const box = $("task-list");
+    box.textContent = "";
+    if (!tasks.length) {
+      box.innerHTML = '<div class="muted">还没有下载任务</div>';
+      return;
+    }
+    const el = (tag, cls, text) => {
+      const node = document.createElement(tag);
+      if (cls) node.className = cls;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    };
+    const baseName = (p) => (p && p !== "." ? p.split("/").filter(Boolean).pop() : "");
+    const list = el("ul", "tasks");
+    for (const t of tasks) {
+      const li = el("li", "task");
+
+      const head = el("div", "task-head");
+      head.appendChild(el("div", "task-title", baseName(t.saved_to) || baseName(t.pan_path) || t.url));
+      head.appendChild(el("span", "badge st-" + t.status, TASK_STATUS[t.status] || t.status));
+      li.appendChild(head);
+
+      const prog = el("div", "task-progress");
+      const bar = el("div", "bar");
+      const fill = el("div");
+      fill.style.width = (t.progress || 0) + "%";
+      bar.appendChild(fill);
+      prog.appendChild(bar);
+      const parts = [(t.progress || 0) + "%"];
+      if (t.total != null) parts.push(t.status === "done" ? fmtBytes(t.total) : `${fmtBytes(t.downloaded || 0)} / ${fmtBytes(t.total)}`);
+      if (t.speed != null) parts.push(fmtBytes(t.speed) + "/s");
+      if (t.eta != null) parts.push("剩余 " + fmtEta(t.eta));
+      prog.appendChild(el("span", "", parts.join(" · ")));
+      li.appendChild(prog);
+
+      const meta = el("div", "task-meta");
+      if (t.saved_to) meta.appendChild(el("span", "", "服务器：downloads/" + (t.saved_to === "." ? "" : t.saved_to)));
+      if (t.pan_path) meta.appendChild(el("span", "", "网盘：" + t.pan_path));
+      if (baseName(t.saved_to) || baseName(t.pan_path)) meta.appendChild(el("span", "", "链接：" + t.url));
+      if (t.created_at) meta.appendChild(el("span", "", "提交：" + new Date(t.created_at).toLocaleString()));
+      li.appendChild(meta);
+
+      if (t.error) {
+        const e = t.error;
+        li.appendChild(el("div", "task-error", e.hint ? `${e.hint}（${e.message}）` : `${e.message}（${e.code}）`));
+      }
+      list.appendChild(li);
+    }
+    box.appendChild(list);
+  }
+
+  async function loadTasks() {
+    clearTimeout(taskTimer);
+    if (!getKey()) return;
+    const data = await call("GET", "/tasks");
+    if (!data.ok) {
+      setMsg("task-msg", false, errText(data));
+      return;
+    }
+    renderTasks(data.data);
+    if (data.data.some((t) => t.status === "queued" || t.status === "running")) {
+      taskTimer = setTimeout(loadTasks, 2000);
+    }
+  }
+
+  function loadKey() {
+    const key = getKey();
+    $("key").value = key;
+    $("key-tip").hidden = !!key;
+  }
+
+  function route() {
+    const page = location.hash === "#login" ? "login" : "download";
+    $("page-download").hidden = page !== "download";
+    $("page-login").hidden = page !== "login";
+    document.querySelectorAll("nav a").forEach((a) => {
+      if (a.dataset.page === page) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
+    });
+    if (page === "login") refreshStatus(false);
+    else loadTasks();
+  }
+
+  $("task-btn").onclick = async () => {
+    const data = await call("POST", "/tasks", { text: $("task-text").value });
+    if (data.ok) {
+      $("task-text").value = "";
+      setMsg("task-msg", true, "已提交，任务 ID：" + data.data.id);
+      loadTasks();
+    } else {
+      setMsg("task-msg", false, errText(data));
+    }
+  };
+  $("task-refresh").onclick = loadTasks;
+
+  $("key-save").onclick = () => {
+    const key = $("key").value.trim();
+    if (!key) { setMsg("key-msg", false, "请输入访问密钥"); return; }
+    localStorage.setItem(KEY_STORE, key);
+    loadKey();
+    setMsg("key-msg", true, "已保存在本浏览器");
+    refreshStatus(false);
+  };
+  $("key-clear").onclick = () => {
+    localStorage.removeItem(KEY_STORE);
+    loadKey();
+    setMsg("key-msg", true, "已清除");
+    refreshStatus(false);
+  };
+
+  $("status-btn").onclick = () => refreshStatus(true);
+
+  $("login-url-btn").onclick = async () => {
+    const data = await call("POST", "/login/url", { accept_disclaimer: $("accept").checked });
+    const box = $("login-url");
+    box.textContent = "";
+    if (data.ok && data.data && data.data.auth_url) {
+      const a = document.createElement("a");
+      a.href = data.data.auth_url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = "打开授权页面（10 分钟内有效）";
+      box.appendChild(a);
+      setMsg("login-msg", true, "请在打开的页面完成授权，再把授权码粘贴到下面");
+    } else {
+      setMsg("login-msg", false, errText(data));
+    }
+  };
+
+  $("login-code-btn").onclick = async () => {
+    const data = await call("POST", "/login/code", { code: $("auth-code").value.trim() });
+    if (data.ok) {
+      $("auth-code").value = "";
+      setMsg("login-msg", true, "登录成功");
+      refreshStatus(false);
+    } else {
+      setMsg("login-msg", false, errText(data));
+    }
+  };
+
+  window.addEventListener("hashchange", route);
+  loadKey();
+  route();
+  if (location.hash !== "#login") refreshStatus(false);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+services:
+  baidu-easy:
+    build: .
+    image: baidu-easy:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      BAIDU_EASY_API_KEY: ${BAIDU_EASY_API_KEY:?请先设置 BAIDU_EASY_API_KEY}
+    volumes:
+      - baidu-easy-data:/data
+      - ./downloads:/downloads
+
+volumes:
+  baidu-easy-data:
