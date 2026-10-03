@@ -13,8 +13,8 @@ from app.bdpan import BdpanError
 _SHARE_RE = re.compile(r"https?://pan\.baidu\.com/s/[A-Za-z0-9_\-]+(?:\?[A-Za-z0-9=&_\-]*)?")
 _PWD_TEXT_RE = re.compile(r"提取码\s*[:：]?\s*([A-Za-z0-9]{4})")
 _PERCENT_RE = re.compile(r"(\d{1,3})(?:\.\d+)?%")
-_SIZE = r"([\d.]+)\s*([kMGTP]?B)"
-_STATS_RE = re.compile(rf"\(\s*{_SIZE}\s*/\s*{_SIZE}(?:,\s*{_SIZE}/s)?\s*\)\s*\[[^:\]]*:([^\]]*)\]")
+# 修复：匹配 (8.8/12 MB, 82 kB/s) [1m50s:35s] 格式
+_STATS_RE = re.compile(r"\(\s*([\d.]+)/([\d.]+)\s*([kMGTP]?B)(?:,\s*([\d.]+)\s*([kMGTP]?B)/s)?\s*\)\s*\[[^:\]]*:([^\]]*)\]")
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
 _UNITS = {"B": 1, "kB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4, "PB": 1000**5}
 _DURATION_UNITS = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
@@ -334,13 +334,19 @@ class TaskQueue:
             parent_dir = os.path.dirname(full_path)
             filename = os.path.basename(full_path)
             
+            print(f"[网盘下载] 完整路径: {full_path}")
+            print(f"[网盘下载] 父目录: {parent_dir}, 文件名: {filename}")
+            
             ls_result = await self.bdpan.run("ls", [parent_dir], [])
             items = ls_result.get("items", [])
+            
+            print(f"[网盘下载] ls 返回 {len(items)} 个项目")
             
             filesize = None
             for item in items:
                 if item.get("server_filename") == filename or item.get("name") == filename:
                     filesize = item.get("size")
+                    print(f"[网盘下载] 找到文件，大小: {filesize}")
                     break
             
             # 如果获取到大小，使用 size 目录
@@ -348,9 +354,12 @@ class TaskQueue:
                 size_dir = os.path.join(self.download_dir, str(filesize))
                 os.makedirs(size_dir, exist_ok=True)
                 target = os.path.join(size_dir, "")
+                print(f"[网盘下载] 目标目录: {target}")
             else:
                 target = os.path.join(self.download_dir, "")
-        except Exception:
+                print(f"[网盘下载] 未获取到大小，使用根目录: {target}")
+        except Exception as e:
+            print(f"[网盘下载] 获取文件信息失败: {e}")
             target = os.path.join(self.download_dir, "")
         
         tail = ""
@@ -366,11 +375,26 @@ class TaskQueue:
             for stats in _STATS_RE.finditer(text):
                 pass
             if stats:
-                task["downloaded"] = _bytes(stats.group(1), stats.group(2))
-                task["total"] = _bytes(stats.group(3), stats.group(4))
-                task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
-                task["eta"] = _seconds(stats.group(7))
+                # 新格式：(8.8/12 MB, 82 kB/s) [1m50s:35s]
+                # group(1): 8.8 (已下载数值)
+                # group(2): 12 (总大小数值)
+                # group(3): MB (共享单位)
+                # group(4): 82 (速度数值)
+                # group(5): kB (速度单位)
+                # group(6): 35s (剩余时间)
+                task["downloaded"] = _bytes(stats.group(1), stats.group(3))
+                task["total"] = _bytes(stats.group(2), stats.group(3))
+                task["speed"] = _bytes(stats.group(4), stats.group(5)) if stats.group(4) else None
+                task["eta"] = _seconds(stats.group(6))
+            else:
+                # 调试：输出最后一行看看格式
+                last_line = text.strip().split('\n')[-1] if text.strip() else ""
+                if last_line and '%' in last_line:
+                    print(f"[调试] 未匹配的输出: {last_line}")
             tail = re.split(r"[\r\n]", text)[-1][-512:]
+            # 只有匹配到 stats 时才保存，减少 I/O
+            if stats:
+                self._save()
 
         try:
             full_netdisk_path = f"/apps/bdpan/{netdisk_path}"
@@ -440,11 +464,26 @@ class TaskQueue:
             for stats in _STATS_RE.finditer(text):
                 pass
             if stats:
-                task["downloaded"] = _bytes(stats.group(1), stats.group(2))
-                task["total"] = _bytes(stats.group(3), stats.group(4))
-                task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
-                task["eta"] = _seconds(stats.group(7))
+                # 新格式：(8.8/12 MB, 82 kB/s) [1m50s:35s]
+                # group(1): 8.8 (已下载数值)
+                # group(2): 12 (总大小数值)
+                # group(3): MB (共享单位)
+                # group(4): 82 (速度数值)
+                # group(5): kB (速度单位)
+                # group(6): 35s (剩余时间)
+                task["downloaded"] = _bytes(stats.group(1), stats.group(3))
+                task["total"] = _bytes(stats.group(2), stats.group(3))
+                task["speed"] = _bytes(stats.group(4), stats.group(5)) if stats.group(4) else None
+                task["eta"] = _seconds(stats.group(6))
+            else:
+                # 调试：输出最后一行看看格式
+                last_line = text.strip().split('\n')[-1] if text.strip() else ""
+                if last_line and '%' in last_line:
+                    print(f"[调试] 未匹配的输出: {last_line}")
             tail = re.split(r"[\r\n]", text)[-1][-512:]
+            # 只有匹配到 stats 时才保存，减少 I/O
+            if stats:
+                self._save()
 
         flags = []
         pwd = task.get("pwd")
