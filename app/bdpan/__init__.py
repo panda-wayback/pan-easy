@@ -55,6 +55,36 @@ class Bdpan:
         if positionals:
             argv += ["--", *positionals]
 
+        return await self._exec(argv, command, stdin, on_output)
+
+    async def run_subcommand(
+        self,
+        command: str,
+        subcommand: str,
+        positionals: Sequence[str] = (),
+        flags: Sequence[str] = (),
+        stdin: Optional[str] = None,
+        on_output: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """运行带子命令的 bdpan 命令，如 transfer list"""
+        if command not in COMMANDS:
+            raise BdpanError("forbidden_command", f"不允许的子命令：{command}")
+
+        # 构建命令：bdpan command subcommand --json --no-check-update flags -- positionals
+        argv = [self.binary, command, subcommand, "--json", "--no-check-update", *flags]
+        if positionals:
+            argv += ["--", *positionals]
+
+        return await self._exec(argv, command, stdin, on_output)
+
+    async def _exec(
+        self,
+        argv: list[str],
+        command: str,
+        stdin: Optional[str] = None,
+        on_output: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,

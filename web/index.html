@@ -74,6 +74,7 @@
   .task-link { font-family: var(--mono); font-size: 12px; flex: 1 1 260px; }
   .task-id { font-family: var(--mono); color: var(--text); user-select: all; }
   .task-error { font-size: 13px; color: var(--danger); word-break: break-all; }
+  .task-info { font-size: 13px; color: #64748b; word-break: break-all; }
   [hidden] { display: none !important; }
   @media (max-width: 768px) {
     .layout { grid-template-columns: 1fr; }
@@ -292,6 +293,29 @@
       };
       row("任务 ID", t.id, "task-id");
       row("服务器", t.saved_to && t.saved_to !== "." ? "downloads/" + t.saved_to : "-");
+      
+      // 转存状态标记
+      let transferStatus = "-";
+      if (t.error && t.error.code === "local_exists") {
+        // 本地已有文件
+        transferStatus = "💾 本地已有";
+      } else if (t.error && t.error.code === "skipped_transfer") {
+        // 完成后确认跳过了转存
+        transferStatus = "⏭️ 跳过（网盘已有）";
+      } else if (t.status === "done" && t.pan_path) {
+        // 完成且有网盘路径 = 已转存
+        transferStatus = "✅ 已转存";
+      } else if (t.will_skip_transfer === true) {
+        // 运行中，将跳过转存
+        transferStatus = "⏭️ 将跳过（网盘已有）";
+      } else if (t.will_skip_transfer === false) {
+        // 运行中，正在转存
+        transferStatus = "🔄 转存中...";
+      } else if (t.status === "running" || t.status === "queued") {
+        transferStatus = "⏳ 检查中...";
+      }
+      row("转存状态", transferStatus);
+      
       row("网盘", t.pan_path || "-");
       row("分享链接", t.url);
       row("提交时间", t.created_at ? new Date(t.created_at).toLocaleString() : "-");
@@ -357,6 +381,15 @@
       }
 
       const isRunning = t.status === "queued" || t.status === "running";
+      
+      // 查看日志按钮
+      const logBtn = el("button", "secondary", "日志");
+      logBtn.onclick = () => {
+        showTaskLog(t);
+      };
+      actions.appendChild(logBtn);
+      hasActions = true;
+      
       const delBtn = el("button", "danger", isRunning ? "停止" : "删除");
       delBtn.onclick = () => {
         const confirmMsg = isRunning 
@@ -379,7 +412,10 @@
 
       if (t.error) {
         const e = t.error;
-        li.appendChild(el("div", "task-error", e.hint ? `${e.hint}（${e.message}）` : `${e.message}（${e.code}）`));
+        const isInfo = e.code === "skipped_transfer";
+        const className = isInfo ? "task-info" : "task-error";
+        const text = e.hint ? `${e.hint}（${e.message}）` : `${e.message}（${e.code}）`;
+        li.appendChild(el("div", className, isInfo ? "ℹ️ " + text : text));
       }
       list.appendChild(li);
     }
@@ -398,6 +434,52 @@
     if (data.data.some((t) => t.status === "queued" || t.status === "running")) {
       taskTimer = setTimeout(loadTasks, 2000);
     }
+  }
+
+  function showTaskLog(task) {
+    const modal = document.createElement("div");
+    modal.style.cssText = "position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px;";
+    
+    const panel = document.createElement("div");
+    panel.style.cssText = "background:#1e293b;border-radius:8px;max-width:800px;width:100%;max-height:80vh;display:flex;flex-direction:column;";
+    
+    const header = document.createElement("div");
+    header.style.cssText = "padding:16px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center;";
+    header.innerHTML = `<h3 style="margin:0;color:#f1f5f9;">任务日志 - ${task.id}</h3><button style="background:none;border:none;color:#94a3b8;font-size:24px;cursor:pointer;padding:0;width:32px;height:32px;">×</button>`;
+    
+    const content = document.createElement("pre");
+    content.style.cssText = "flex:1;overflow:auto;padding:16px;margin:0;color:#cbd5e1;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all;";
+    
+    const logInfo = [];
+    logInfo.push(`任务 ID: ${task.id}`);
+    logInfo.push(`状态: ${task.status}`);
+    logInfo.push(`进度: ${task.progress}%`);
+    logInfo.push(`分享链接: ${task.url}`);
+    if (task.pan_path) logInfo.push(`网盘路径: ${task.pan_path}`);
+    if (task.saved_to) logInfo.push(`服务器路径: downloads/${task.saved_to}`);
+    logInfo.push(`创建时间: ${task.created_at ? new Date(task.created_at).toLocaleString() : '-'}`);
+    if (task.finished_at) logInfo.push(`完成时间: ${new Date(task.finished_at).toLocaleString()}`);
+    if (task.error) {
+      logInfo.push(`\n错误信息:`);
+      logInfo.push(`  代码: ${task.error.code}`);
+      logInfo.push(`  消息: ${task.error.message}`);
+      if (task.error.hint) logInfo.push(`  提示: ${task.error.hint}`);
+    }
+    if (task.result) {
+      logInfo.push(`\n返回结果:`);
+      logInfo.push(JSON.stringify(task.result, null, 2));
+    }
+    
+    content.textContent = logInfo.join('\n');
+    
+    panel.appendChild(header);
+    panel.appendChild(content);
+    modal.appendChild(panel);
+    
+    header.querySelector("button").onclick = () => document.body.removeChild(modal);
+    modal.onclick = (e) => { if (e.target === modal) document.body.removeChild(modal); };
+    
+    document.body.appendChild(modal);
   }
 
   function loadKey() {

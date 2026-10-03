@@ -185,59 +185,156 @@ class TaskQueue:
         task["status"] = "running"
         self._save()
 
+        # 0. 检查本地文件是否已存在（优先级最高）
+        local_file = await self._check_local_file(task["url"], task.get("pwd"))
+        if local_file:
+            task["status"] = "done"
+            task["progress"] = 100
+            task["saved_to"] = local_file
+            task["speed"] = None
+            task["eta"] = None
+            task["finished_at"] = _now()
+            # 标记为本地已有
+            if not task.get("error"):
+                task["error"] = {
+                    "code": "local_exists",
+                    "message": "文件已在本地下载目录",
+                    "errno": None,
+                    "hint": f"跳过下载：downloads/{local_file}"
+                }
+            self._save()
+            return
+
         # 1. 智能下载：先尝试查找网盘中是否已存在该文件
         if self.enable_smart_download:
             existing_path = await self._find_existing_in_netdisk(task["url"], task.get("pwd"))
             
             if existing_path:
+                # 标记：将跳过转存
+                task["will_skip_transfer"] = True
+                self._save()
+                
                 # 2. 直接从网盘下载（跳过转存）
                 success = await self._download_from_netdisk(task, existing_path)
                 if success:
                     return
-
+            else:
+                # 标记：将进行转存
+                task["will_skip_transfer"] = False
+                self._save()
+        
         # 3. 正常的转存 + 下载流程
         await self._download_from_share(task)
+
+    async def _check_local_file(self, url: str, pwd: Optional[str]) -> Optional[str]:
+        """检查本地下载目录是否已有文件（按名称和大小匹配）"""
+        try:
+            # 获取分享文件信息
+            flags = []
+            if pwd:
+                flags += ["-p", pwd]
+            
+            share_list = await self.bdpan.run_subcommand("transfer", "list", [url], flags)
+            items = share_list.get("items", [])
+            
+            if not items or len(items) != 1 or items[0].get("is_dir"):
+                return None
+            
+            file_info = items[0]
+            filename = file_info.get("name")
+            filesize = file_info.get("size")
+            
+            if not filename or filesize is None:
+                return None
+            
+            # 检查本地文件：downloads/{size}/{filename}
+            size_dir = str(filesize)
+            local_path = os.path.join(self.download_dir, size_dir, filename)
+            
+            if os.path.isfile(local_path):
+                local_size = os.path.getsize(local_path)
+                if local_size == filesize:
+                    # 返回相对路径
+                    return os.path.join(size_dir, filename)
+            
+            return None
+            
+        except Exception:
+            return None
 
     async def _find_existing_in_netdisk(self, url: str, pwd: Optional[str]) -> Optional[str]:
         """在网盘的转存目录中查找是否已存在该文件"""
         try:
-            # 获取分享链接的文件信息
+            # 步骤1：使用 transfer list 获取分享文件信息
             flags = []
             if pwd:
                 flags += ["-p", pwd]
-            flags += ["--json"]
             
-            share_list = await self.bdpan.run("transfer", ["list", url] + flags, [])
+            share_list = await self.bdpan.run_subcommand("transfer", "list", [url], flags)
             items = share_list.get("items", [])
+            
             if not items:
                 return None
             
-            # 只处理单文件情况（多文件/文件夹仍走正常流程）
-            if len(items) != 1 or items[0].get("isdir"):
+            # 只处理单文件情况
+            if len(items) != 1 or items[0].get("is_dir"):
                 return None
             
             file_info = items[0]
-            filename = file_info["server_filename"]
+            filename = file_info.get("name")
             filesize = file_info.get("size")
             
-            # 在网盘的 bdpan 应用目录中搜索
-            search_result = await self.bdpan.run("search", [filename], ["--no-dir", "--json"])
+            if not filename:
+                return None
+            
+            # 步骤2：在网盘中搜索同名文件
+            search_result = await self.bdpan.run("search", [filename], ["--no-dir"])
             
             for item in search_result.get("items", []):
-                # 文件名和大小都匹配，且在 /apps/bdpan/ 目录下
-                if (item["server_filename"] == filename and 
-                    item.get("size") == filesize and
+                # 匹配：文件名、大小、路径在 /apps/bdpan/ 下
+                item_name = item.get("server_filename") or item.get("name")
+                item_size = item.get("size")
+                
+                if (item_name == filename and 
+                    item_size == filesize and
                     item["path"].startswith("/apps/bdpan/")):
-                    # 返回相对路径（去掉 /apps/bdpan/ 前缀）
-                    return item["path"].replace("/apps/bdpan/", "")
+                    relative_path = item["path"].replace("/apps/bdpan/", "")
+                    return relative_path
             
             return None
+            
         except Exception:
-            # 查找失败，继续正常流程
+            return None
             return None
 
     async def _download_from_netdisk(self, task: dict[str, Any], netdisk_path: str) -> bool:
         """直接从网盘下载（跳过转存）"""
+        # 获取网盘文件信息以确定 size 目录
+        try:
+            # 先列出网盘文件信息
+            full_path = f"/apps/bdpan/{netdisk_path}"
+            parent_dir = os.path.dirname(full_path)
+            filename = os.path.basename(full_path)
+            
+            ls_result = await self.bdpan.run("ls", [parent_dir], [])
+            items = ls_result.get("items", [])
+            
+            filesize = None
+            for item in items:
+                if item.get("server_filename") == filename or item.get("name") == filename:
+                    filesize = item.get("size")
+                    break
+            
+            # 如果获取到大小，使用 size 目录
+            if filesize is not None:
+                size_dir = os.path.join(self.download_dir, str(filesize))
+                os.makedirs(size_dir, exist_ok=True)
+                target = os.path.join(size_dir, "")
+            else:
+                target = os.path.join(self.download_dir, "")
+        except Exception:
+            target = os.path.join(self.download_dir, "")
+        
         tail = ""
 
         def on_output(text: str) -> None:
@@ -257,9 +354,9 @@ class TaskQueue:
                 task["eta"] = _seconds(stats.group(7))
             tail = re.split(r"[\r\n]", text)[-1][-512:]
 
-        target = os.path.join(self.download_dir, "")
         try:
-            data = await self.bdpan.run("download", [netdisk_path, target], [], on_output=on_output)
+            full_netdisk_path = f"/apps/bdpan/{netdisk_path}"
+            data = await self.bdpan.run("download", [full_netdisk_path, target], [], on_output=on_output)
             task["result"] = data
             task["status"] = "done"
             task["progress"] = 100
@@ -286,6 +383,32 @@ class TaskQueue:
 
     async def _download_from_share(self, task: dict[str, Any]) -> None:
         """正常的转存 + 下载流程"""
+        # 先获取文件信息以确定 size 目录
+        try:
+            flags = []
+            pwd = task.get("pwd")
+            if pwd:
+                flags += ["-p", pwd]
+            
+            share_list = await self.bdpan.run_subcommand("transfer", "list", [task["url"]], flags)
+            items = share_list.get("items", [])
+            
+            # 如果能获取到单文件信息，使用 size 目录
+            if items and len(items) == 1 and not items[0].get("is_dir"):
+                filesize = items[0].get("size")
+                if filesize is not None:
+                    size_dir = os.path.join(self.download_dir, str(filesize))
+                    os.makedirs(size_dir, exist_ok=True)
+                    target = os.path.join(size_dir, "")
+                else:
+                    target = os.path.join(self.download_dir, "")
+            else:
+                # 多文件或文件夹，使用根目录
+                target = os.path.join(self.download_dir, "")
+        except Exception:
+            # 获取失败，降级到根目录
+            target = os.path.join(self.download_dir, "")
+        
         tail = ""
 
         def on_output(text: str) -> None:
@@ -309,7 +432,6 @@ class TaskQueue:
         pwd = task.get("pwd")
         if pwd:
             flags += ["-p", pwd]
-        target = os.path.join(self.download_dir, "")
         try:
             data = await self.bdpan.run("download", [task["url"], target], flags, on_output=on_output)
         except BdpanError as err:
