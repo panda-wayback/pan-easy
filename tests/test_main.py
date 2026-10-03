@@ -155,6 +155,14 @@ def test_download_link(fake_bin, tmp_path):
     assert link("running").json()["error"]["code"] == "task_not_ready"
     assert link("nope").status_code == 404
     assert link("escape").json()["error"]["code"] == "file_missing"
+    proxied = client.post(
+        "/api/tasks/one/link",
+        headers={**AUTH, "Host": "127.0.0.1:8080", "X-Forwarded-Proto": "https", "X-Forwarded-Host": "pan.example.com, inner"},
+    )
+    assert proxied.json()["data"]["url"].startswith("https://pan.example.com/dl/one?")
+    host_only = client.post("/api/tasks/one/link", headers={**AUTH, "Host": "pan.example.com:8080"})
+    assert host_only.json()["data"]["url"].startswith("http://pan.example.com:8080/dl/one?")
+
     assert link("one", expires_in=10).status_code == 400
     assert link("one", expires_in=604801).status_code == 400
     assert client.post("/api/tasks/one/link").status_code == 401

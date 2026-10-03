@@ -78,6 +78,17 @@ def _sign(api_key: str, task_id: str, exp: int) -> str:
     return hmac.new(api_key.encode(), f"{task_id}.{exp}".encode(), hashlib.sha256).hexdigest()[:32]
 
 
+def _public_base(request: Request) -> str:
+    def forwarded(name: str) -> str:
+        return request.headers.get(name, "").split(",")[0].strip()
+
+    scheme = forwarded("x-forwarded-proto").lower()
+    if scheme not in ("http", "https"):
+        scheme = request.url.scheme
+    host = forwarded("x-forwarded-host") or request.url.netloc
+    return f"{scheme}://{host}"
+
+
 def _task_file(tasks: TaskQueue, task_id: str) -> Path:
     task = tasks.get(task_id)
     if task is None:
@@ -380,7 +391,7 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
     async def task_link(request: Request, task_id: str, body: Optional[LinkBody] = Body(None)):
         _task_file(tasks, task_id)
         exp = int(time.time()) + (body or LinkBody()).expires_in
-        url = f"{request.url.scheme}://{request.url.netloc}/dl/{task_id}?exp={exp}&sig={_sign(api_key, task_id, exp)}"
+        url = f"{_public_base(request)}/dl/{task_id}?exp={exp}&sig={_sign(api_key, task_id, exp)}"
         expires_at = datetime.fromtimestamp(exp, timezone.utc).astimezone().isoformat(timespec="seconds")
         return _ok({"url": url, "expires_at": expires_at})
 
