@@ -291,10 +291,19 @@
         meta.appendChild(el("dd", cls || "", value));
       };
       row("任务 ID", t.id, "task-id");
-      if (t.saved_to) row("服务器", "downloads/" + (t.saved_to === "." ? "" : t.saved_to));
-      if (t.pan_path) row("网盘", t.pan_path);
-      if (baseName(t.saved_to) || baseName(t.pan_path)) row("分享链接", t.url);
-      if (t.created_at) row("提交时间", new Date(t.created_at).toLocaleString());
+      row("服务器", t.saved_to && t.saved_to !== "." ? "downloads/" + t.saved_to : "-");
+      row("网盘", t.pan_path || "-");
+      row("分享链接", t.url);
+      row("提交时间", t.created_at ? new Date(t.created_at).toLocaleString() : "-");
+      if (t.finished_at && t.created_at) {
+        const duration = Math.round((new Date(t.finished_at) - new Date(t.created_at)) / 1000);
+        const formatDuration = (sec) => {
+          if (sec < 60) return sec + " 秒";
+          if (sec < 3600) return Math.floor(sec / 60) + " 分钟";
+          return Math.floor(sec / 3600) + " 小时 " + Math.floor((sec % 3600) / 60) + " 分钟";
+        };
+        row("耗时", formatDuration(duration));
+      }
       li.appendChild(meta);
 
       const actions = el("div", "task-actions");
@@ -315,7 +324,11 @@
         };
         if (links[t.id]) show(links[t.id]);
         btn.onclick = async () => {
+          btn.disabled = true;
+          btn.textContent = "生成中...";
           const data = await call("POST", `/tasks/${t.id}/link`);
+          btn.disabled = false;
+          btn.textContent = "复制下载链接";
           if (!data.ok) { note.className = "msg err"; note.textContent = errText(data); return; }
           let copied = false;
           try { await navigator.clipboard.writeText(data.data.url); copied = true; } catch (e) {}
@@ -343,12 +356,16 @@
         hasActions = true;
       }
 
-      const delBtn = el("button", "danger", "删除");
+      const isRunning = t.status === "queued" || t.status === "running";
+      const delBtn = el("button", "danger", isRunning ? "停止" : "删除");
       delBtn.onclick = () => {
-        if (!confirm("删除这条任务记录？已下载的文件不会删除。")) return;
+        const confirmMsg = isRunning 
+          ? "停止这个任务？已下载的部分将被保留，任务记录将被删除。"
+          : "删除这条任务记录？已下载的文件不会删除。";
+        if (!confirm(confirmMsg)) return;
         call("DELETE", `/tasks/${t.id}`).then((data) => {
           if (data.ok) {
-            setMsg("task-msg", true, "已删除任务 " + t.id);
+            setMsg("task-msg", true, isRunning ? "已停止任务 " + t.id : "已删除任务 " + t.id);
             loadTasks();
           } else {
             setMsg("task-msg", false, errText(data));
