@@ -22,6 +22,7 @@ build:
 	docker compose build
 
 up:
+	mkdir -p downloads
 	docker compose up -d
 
 down:
