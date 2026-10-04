@@ -29,6 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY web ./web
+COPY templates ./templates
 
 RUN useradd --create-home --uid 1000 app \
     && mkdir -p /data/bdpan /downloads \

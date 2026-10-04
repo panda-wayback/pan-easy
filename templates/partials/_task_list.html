@@ -1,0 +1,13 @@
+<div id="task-list-root"
+     {% if link_for %}hx-vals='{"link_for":"{{ link_for }}"}'{% endif %}
+     {% if has_active %} hx-get="/session/tasks" hx-trigger="load delay:2s" hx-swap="outerHTML"{% endif %}>
+  {% if tasks %}
+  <ul class="tasks">
+    {% for t in tasks %}{% with link_for=link_for, link_url=link_url %}
+      {% include 'partials/_task_card.html' %}
+    {% endwith %}{% endfor %}
+  </ul>
+  {% else %}
+  <div class="muted">还没有下载任务</div>
+  {% endif %}
+</div>

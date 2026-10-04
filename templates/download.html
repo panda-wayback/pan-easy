@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}下载 - baidu-easy{% endblock %}
+{% block side_status %}{% include 'partials/_side_status.html' %}{% endblock %}
+{% block content %}
+<h1>下载</h1>
+{% if not has_key %}
+<div class="tip">还没有设置访问密钥，请先到 <a href="/login">登录页</a> 设置。</div>
+{% endif %}
+<section>
+  <h2>粘贴分享文字</h2>
+  <div class="muted" style="margin-bottom:8px">把百度网盘的分享文字整段粘贴进来，文件会在后台下载到服务器的下载目录（项目下的 downloads/）。</div>
+  <form hx-post="/session/tasks" hx-target="#task-list-root" hx-swap="outerHTML">
+    <div class="row">
+      <textarea id="task-text" name="text" placeholder="例如：&#10;通过百度网盘分享的文件：xxx.zip&#10;链接：https://pan.baidu.com/s/xxxx?pwd=abcd&#10;复制这段内容打开「百度网盘APP 即可获取」"></textarea>
+    </div>
+    <div class="row">
+      <button type="submit">开始下载</button>
+      <button type="button" class="secondary" hx-get="/session/tasks" hx-target="#task-list-root" hx-swap="outerHTML">刷新任务</button>
+    </div>
+  </form>
+  <div class="msg" id="task-msg"></div>
+</section>
+<section>
+  <h2>下载任务</h2>
+  {% include 'partials/_task_list.html' %}
+</section>
+{% endblock %}

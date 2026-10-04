@@ -1,7 +1,7 @@
 ---
 description: >-
   通用工作流：Agent 判断、方案先行、Skill 调度。写/改自维护 Skill 另遵 skill-writing.mdc。可整包复制到他仓。
-alwaysApply: true
+alwaysApply: false
 ---
 
 # 工作流硬约束（通用）

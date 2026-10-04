@@ -1,6 +1,7 @@
 *
 !app/
 !web/
+!templates/
 !requirements.txt
 !entrypoint.sh
 **/__pycache__

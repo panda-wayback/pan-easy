@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}日志 - baidu-easy{% endblock %}
+{% block side_status %}{% include 'partials/_side_status.html' %}{% endblock %}
+{% block content %}
+<h1>日志</h1>
+<section>
+  <h2>系统日志</h2>
+  {% include 'partials/_logs.html' %}
+  <div class="msg" id="logs-msg"></div>
+</section>
+{% endblock %}

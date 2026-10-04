@@ -1,0 +1,4 @@
+<div class="side-status" id="side-status"
+     hx-get="/session/side-status" hx-trigger="load delay:3s" hx-swap="outerHTML">
+  <span class="dot{{ ' ' + state_class if state_class }}"></span><span>{{ state_text }}</span>
+</div>

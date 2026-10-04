@@ -1,0 +1,27 @@
+<div class="dialog-head">
+  <h3>任务详情</h3>
+  <form method="dialog"><button class="icon-btn" value="close" aria-label="关闭">&times;</button></form>
+</div>
+<div class="dialog-body">
+  <dl class="kv">
+    <dt>任务 ID</dt><dd class="task-id">{{ t.id }}</dd>
+    <dt>状态</dt><dd>{{ status_label(t.status) }}（{{ t.progress or 0 }}%）</dd>
+    <dt>分享链接</dt><dd>{{ t.url }}</dd>
+    {% if t.pan_path %}<dt>网盘路径</dt><dd>{{ t.pan_path }}</dd>{% endif %}
+    {% if t.saved_to and t.saved_to != '.' %}<dt>服务器路径</dt><dd>downloads/{{ t.saved_to }}</dd>{% endif %}
+    <dt>创建时间</dt><dd>{{ t.created_at | localtime if t.created_at else '-' }}</dd>
+    <dt>完成时间</dt><dd>{{ t.finished_at | localtime if t.finished_at else '-' }}</dd>
+  </dl>
+  {% if t.error %}
+  <h4>错误信息</h4>
+  <dl class="kv">
+    <dt>代码</dt><dd>{{ t.error.code }}</dd>
+    <dt>消息</dt><dd>{{ t.error.message }}</dd>
+    {% if t.error.hint %}<dt>提示</dt><dd>{{ t.error.hint }}</dd>{% endif %}
+  </dl>
+  {% endif %}
+  {% if t.result %}
+  <h4>返回结果</h4>
+  <pre class="dialog-json">{{ t.result | tojson(indent=2) }}</pre>
+  {% endif %}
+</div>

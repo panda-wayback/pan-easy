@@ -1,0 +1,13 @@
+<div id="logs-root"
+     {% if auto %}hx-get="/session/logs?auto=on" hx-trigger="load delay:2s" hx-swap="outerHTML"{% endif %}>
+  <div class="row">
+    <button class="secondary" hx-get="/session/logs" hx-target="#logs-root" hx-swap="outerHTML">刷新</button>
+    <button class="secondary" hx-post="/session/logs/clear" hx-target="#logs-root" hx-swap="outerHTML">清空</button>
+    <label style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" name="auto" value="on" {% if auto %}checked{% endif %}
+             hx-get="/session/logs{% if auto %}?auto=on{% endif %}" hx-target="#logs-root" hx-swap="outerHTML">
+      <span>自动刷新</span>
+    </label>
+  </div>
+  <pre id="logs-content" class="scroll-anchor">{% if logs %}{{ logs | join('\n') }}{% else %}{% if error_log %}获取失败：{{ error_log }}{% else %}暂无日志{% endif %}{% endif %}</pre>
+</div>

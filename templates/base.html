@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}baidu-easy{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/htmx.min.js"></script>
+</head>
+<body hx-boost="true">
+<div class="layout">
+  <aside>
+    <div class="brand">baidu-easy</div>
+    <nav>
+      <a href="/" {% if active == 'download' %}aria-current="page"{% endif %}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+        下载
+      </a>
+      <a href="/logs" {% if active == 'logs' %}aria-current="page"{% endif %}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h12"/></svg>
+        日志
+      </a>
+      <a href="/login" {% if active == 'login' %}aria-current="page"{% endif %}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+        登录
+      </a>
+    </nav>
+    {% block side_status %}{% endblock %}
+  </aside>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</div>
+
+<dialog id="task-dialog">
+  <div id="task-dialog-content"></div>
+</dialog>
+
+<script>
+  // 任务提交成功后清空输入框（由响应头 HX-Trigger 触发）
+  document.body.addEventListener('task-created', () => {
+    const box = document.getElementById('task-text');
+    if (box) box.value = '';
+  });
+  // 片段加载后滚动到底部（日志）
+  document.body.addEventListener('htmx:afterSwap', (e) => {
+    if (e.detail.target && e.detail.target.classList && e.detail.target.classList.contains('scroll-anchor')) {
+      e.detail.target.scrollTop = e.detail.target.scrollHeight;
+    }
+  });
+  // 任务详情片段加载后打开原生对话框
+  document.body.addEventListener('htmx:afterOnLoad', (e) => {
+    if (e.detail.requestConfig && e.detail.requestConfig.elt.getAttribute('data-dialog') === 'open') {
+      const dlg = document.getElementById('task-dialog');
+      if (dlg && !dlg.open) dlg.showModal();
+    }
+  });
+</script>
+</body>
+</html>

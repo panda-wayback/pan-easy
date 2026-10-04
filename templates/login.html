@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}登录 - baidu-easy{% endblock %}
+{% block side_status %}{% include 'partials/_side_status.html' %}{% endblock %}
+{% block content %}
+<h1>登录</h1>
+<section>
+  <h2>访问密钥</h2>
+  <form hx-post="/session/key" hx-target="#side-status" hx-swap="outerHTML">
+    <div class="row">
+      <input type="password" id="key" name="key" placeholder="启动服务时设置的 BAIDU_EASY_API_KEY" autocomplete="off">
+      <button type="submit">保存</button>
+    </div>
+  </form>
+  <div class="row">
+    <button type="button" class="secondary" hx-post="/session/key/clear"
+            hx-target="#side-status" hx-swap="outerHTML"
+            hx-on::after-request="document.getElementById('key').value=''">清除</button>
+  </div>
+  <div class="msg" id="key-msg"></div>
+</section>
+
+<section>
+  <h2>登录状态</h2>
+  {% include 'partials/_status_panel.html' %}
+  <div class="msg" id="status-msg"></div>
+</section>
+
+<section>
+  <h2>授权登录</h2>
+  <div class="notice">
+    <strong>bdpan 安全须知</strong>
+    <ol>
+      <li>请备份网盘重要数据，谨慎操作。</li>
+      <li>AI Agent 行为具有不可预测性，请实时人工审核指令执行过程，对执行后果负责。</li>
+      <li>严禁在他人、公用或不可信的环境中扫码授权；公共环境使用完毕后请清除授权。</li>
+      <li>请严格保护配置文件与 Token，切勿在公开仓库或对话中暴露。</li>
+    </ol>
+    <label><input type="checkbox" id="accept" form="login-url-form" name="accept_disclaimer" value="on"> 我已阅读并认可上述条款</label>
+  </div>
+  <form hx-post="/session/login/url" hx-target="#login-url-box" hx-swap="outerHTML">
+    <div class="row">
+      <button type="submit">获取授权链接</button>
+      <span id="login-url-box"></span>
+    </div>
+  </form>
+  <form hx-post="/session/login/code">
+    <div class="row">
+      <input type="text" name="code" placeholder="浏览器中显示的 32 位授权码" autocomplete="off">
+      <button type="submit">提交授权码</button>
+    </div>
+  </form>
+  <div class="msg" id="login-msg"></div>
+</section>
+{% endblock %}

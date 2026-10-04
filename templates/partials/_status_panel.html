@@ -1,0 +1,8 @@
+<div id="status-panel-root">
+  <dl class="kv">
+    <dt>状态</dt><dd>{{ state_text }}</dd>
+    <dt>用户名</dt><dd>{{ username or '-' }}</dd>
+    <dt>有效期至</dt><dd>{{ expires_local if expires_local else '-' }}</dd>
+  </dl>
+  <div class="row"><button class="secondary" hx-post="/session/status" hx-target="#status-panel-root" hx-swap="outerHTML">刷新状态</button></div>
+</div>

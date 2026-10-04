@@ -409,6 +409,22 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
         expires_at = datetime.fromtimestamp(exp, timezone.utc).astimezone().isoformat(timespec="seconds")
         return _ok({"url": url, "expires_at": expires_at})
 
+    @api.get("/logs")
+    async def get_logs(lines: int = Query(100, ge=1, le=1000)):
+        """获取容器日志（最近N行）"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["tail", "-n", str(lines), "/proc/1/fd/1"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            log_lines = result.stdout.splitlines() if result.returncode == 0 else []
+            return _ok({"logs": log_lines})
+        except Exception as e:
+            return _ok({"logs": [f"获取日志失败: {e}"]})
+
     return api
 
 

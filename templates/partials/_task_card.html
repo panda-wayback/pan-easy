@@ -1,0 +1,41 @@
+<li class="task">
+  <div class="task-head">
+    <div class="task-title">{{ t | task_title }}</div>
+    <span class="badge st-{{ t.status }}">{{ status_label(t.status) }}</span>
+  </div>
+  <div class="task-progress">
+    <div class="bar"><div style="width: {{ t.progress or 0 }}%"></div></div>
+    <span>{{ t.progress or 0 }}%</span>
+    {% if t.total %}<span>{{ t.total | fmt_bytes }}</span>{% endif %}
+    {% if t.speed %}<span>{{ t.speed | fmt_bytes }}/s</span>{% endif %}
+    {% if t.eta %}<span>剩余 {{ t.eta | fmt_eta }}</span>{% endif %}
+  </div>
+  {% if link_for == t.id and link_url %}
+  <div class="task-actions">
+    <input class="task-link" readonly value="{{ link_url }}" onclick="this.select()" aria-label="下载链接">
+  </div>
+  {% endif %}
+  {% if t.error %}
+  <div class="{{ 'task-info' if t.error.code == 'skipped_transfer' else 'task-error' }}">
+    {% if t.error.code == 'skipped_transfer' %}ℹ️ {% endif %}{% if t.error.hint %}{{ t.error.hint }}（{{ t.error.message }}）{% else %}{{ t.error.message }}（{{ t.error.code }}）{% endif %}
+  </div>
+  {% endif %}
+  <dl class="task-meta">
+    <dt>任务 ID</dt><dd class="task-id">{{ t.id }}</dd>
+    <dt>分享链接</dt><dd>{{ t.url }}</dd>
+    {% if t.pan_path %}<dt>网盘路径</dt><dd>{{ t.pan_path }}</dd>{% endif %}
+    {% if t.saved_to and t.saved_to != '.' %}<dt>服务器路径</dt><dd>downloads/{{ t.saved_to }}</dd>{% endif %}
+  </dl>
+  <div class="task-actions">
+    {% if can_link(t) %}
+    <button hx-post="/session/tasks/{{ t.id }}/link" hx-target="#task-list-root" hx-swap="outerHTML">复制下载链接</button>
+    {% endif %}
+    {% if t.status in ('failed', 'interrupted') %}
+    <button hx-post="/session/tasks/{{ t.id }}/retry" hx-target="#task-list-root" hx-swap="outerHTML">重试</button>
+    {% endif %}
+    <button class="danger" hx-delete="/session/tasks/{{ t.id }}" hx-target="#task-list-root" hx-swap="outerHTML"
+            hx-confirm="确定删除该任务记录？">删除</button>
+    <button class="secondary" data-dialog="open"
+            hx-get="/session/tasks/{{ t.id }}/detail" hx-target="#task-dialog-content" hx-swap="innerHTML">详情</button>
+  </div>
+</li>

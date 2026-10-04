@@ -338,7 +338,8 @@ class TaskQueue:
             print(f"[网盘下载] 父目录: {parent_dir}, 文件名: {filename}")
             
             ls_result = await self.bdpan.run("ls", [parent_dir], [])
-            items = ls_result.get("items", [])
+            # ls 返回的是列表，不是字典
+            items = ls_result if isinstance(ls_result, list) else []
             
             print(f"[网盘下载] ls 返回 {len(items)} 个项目")
             
@@ -435,20 +436,39 @@ class TaskQueue:
             share_list = await self.bdpan.run_subcommand("transfer", "list", [task["url"]], flags)
             items = share_list.get("items", [])
             
-            # 如果能获取到单文件信息，使用 size 目录
-            if items and len(items) == 1 and not items[0].get("is_dir"):
+            # 检查分享内容
+            if not items:
+                raise ValueError("分享链接无效或已失效")
+            
+            # 判断是否需要打包
+            need_archive = False
+            if len(items) > 1:
+                # 多个文件
+                need_archive = True
+                total_size = sum(item.get("size", 0) for item in items if not item.get("is_dir"))
+                target_dir = os.path.join(self.download_dir, str(total_size) if total_size else "multi")
+            elif items[0].get("is_dir"):
+                # 文件夹
+                need_archive = True
+                target_dir = os.path.join(self.download_dir, "folder")
+            else:
+                # 单文件
+                need_archive = False
                 filesize = items[0].get("size")
                 if filesize is not None:
-                    size_dir = os.path.join(self.download_dir, str(filesize))
-                    os.makedirs(size_dir, exist_ok=True)
-                    target = os.path.join(size_dir, "")
+                    target_dir = os.path.join(self.download_dir, str(filesize))
                 else:
-                    target = os.path.join(self.download_dir, "")
-            else:
-                # 多文件或文件夹，使用根目录
-                target = os.path.join(self.download_dir, "")
+                    target_dir = self.download_dir
+            
+            os.makedirs(target_dir, exist_ok=True)
+            target = os.path.join(target_dir, "")
+            
+        except ValueError as e:
+            # 明确的验证错误，直接抛出
+            raise
         except Exception:
-            # 获取失败，降级到根目录
+            # 其他错误，降级到根目录
+            need_archive = False
             target = os.path.join(self.download_dir, "")
         
         tail = ""
@@ -505,6 +525,51 @@ class TaskQueue:
                 task["status"] = "done"
                 task["progress"] = 100
                 self._fill_result(task, data if isinstance(data, dict) else {})
+                
+                # 如果需要打包，创建压缩包
+                if need_archive:
+                    try:
+                        import shutil
+                        import glob
+                        
+                        # 获取下载的文件/文件夹
+                        downloaded_items = glob.glob(os.path.join(target_dir, "*"))
+                        
+                        if downloaded_items:
+                            # 确定压缩包名称
+                            if len(items) > 1:
+                                archive_name = f"multiple_files_{len(items)}"
+                            elif items[0].get("is_dir"):
+                                archive_name = items[0].get("name", "folder")
+                            else:
+                                archive_name = "archive"
+                            
+                            # 创建 zip 压缩包
+                            archive_path = os.path.join(target_dir, f"{archive_name}.zip")
+                            
+                            print(f"[打包] 开始打包 {len(downloaded_items)} 个项目到 {archive_path}")
+                            
+                            shutil.make_archive(
+                                os.path.join(target_dir, archive_name),
+                                'zip',
+                                target_dir
+                            )
+                            
+                            # 删除原始文件/文件夹
+                            for item_path in downloaded_items:
+                                if os.path.isfile(item_path):
+                                    os.remove(item_path)
+                                elif os.path.isdir(item_path):
+                                    shutil.rmtree(item_path)
+                            
+                            print(f"[打包] 完成，压缩包: {archive_path}")
+                            
+                            # 更新任务信息
+                            task["saved_to"] = os.path.join(os.path.basename(target_dir), f"{archive_name}.zip")
+                            
+                    except Exception as e:
+                        print(f"[打包] 失败: {e}")
+                        # 打包失败不影响任务完成状态
         task["speed"] = None
         task["eta"] = None
         task["finished_at"] = _now()
