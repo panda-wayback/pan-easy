@@ -216,7 +216,7 @@ def create_webui(api_key: str, tasks: TaskQueue) -> FastAPI:
         view = _side_view(request.state.valid_key, status, err)
         return render(
             request, "logs.html", active="logs",
-            auto=False, logs=logs, error_log=error_log,
+            auto=True, logs=logs, error_log=error_log,
             state_class=view["state_class"], state_text=view["state_text"],
         )
 

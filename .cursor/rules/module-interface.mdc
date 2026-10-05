@@ -1,0 +1,23 @@
+---
+description: 编写与修改 interface.yaml 的格式规则
+globs: "**/interface.yaml"
+alwaysApply: false
+---
+# interface.yaml 格式
+
+| 字段 | 必填 | 内容 |
+|---|---|---|
+| `name` | 是 | Module 名 |
+| `function` | 是 | 一句话职责 |
+| `modules` | 是 | 子 Module 的 `path`（相对本目录）+ `function`；无则 `[]` |
+| `input` | 是 | 列表：`name` 写对外调用名（函数、HTTP 接口、消息等），`type` 写输入数据格式，`desc` 写含义；无则 `[]` |
+| `output` | 是 | 列表：`name` 写对应的调用名，`type` 写输出数据格式，`desc` 写含义；无则 `[]` |
+| `contract` | 是，非空 | 调用方可观察到的行为保证、边界条件、不变式 |
+| `depends` | 是 | 直接调用的 Module，写仓库根相对路径；无则 `[]` |
+| `errors` | 否 | `code` / `desc` 列表 |
+| `tests` | 是，非空 | 通过 Input / Output 验证的测试用例；有子 Module 时写 Integration Test |
+
+- 只写调用方需要的信息；禁止写内部实现（内部函数、内部文件结构、内部步骤与调用顺序）。
+- 禁止写设计理由、历史原因、产品背景。
+- 上级 `modules` 只写 `path` + `function`，且与子 Module 自身的 `function` 一致；其余信息只写在子 Module 自己的 `interface.yaml`。
+- 删除或移动 Module 时同步更新上级 `modules` 与调用方的 `depends`。

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
@@ -9,6 +10,8 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from app.bdpan import BdpanError
+
+log = logging.getLogger("baidu_easy.tasks")
 
 _SHARE_RE = re.compile(r"https?://pan\.baidu\.com/s/[A-Za-z0-9_\-]+(?:\?[A-Za-z0-9=&_\-]*)?")
 _PWD_TEXT_RE = re.compile(r"提取码\s*[:：]?\s*([A-Za-z0-9]{4})")
@@ -131,6 +134,7 @@ class TaskQueue:
             await asyncio.wait({current[1]})
         self._tasks.pop(task_id, None)
         self._save()
+        log.info("任务已删除 task=%s", task_id)
         return True
 
     def retry(self, task_id: str) -> Optional[dict[str, Any]]:
@@ -138,7 +142,9 @@ class TaskQueue:
         task = self._tasks.get(task_id)
         if task is None or task["status"] not in ("failed", "interrupted"):
             return None
-        return self._add(task["url"], task.get("pwd"))
+        new_task = self._add(task["url"], task.get("pwd"))
+        log.info("任务重试 origin=%s new=%s", task_id, new_task["id"])
+        return new_task
 
     def _add(self, url: str, pwd: Optional[str]) -> dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
@@ -162,6 +168,7 @@ class TaskQueue:
         self._save()
         self._ensure_worker()
         self._queue.put_nowait(task_id)
+        log.info("任务已提交 task=%s url=%s", task_id, url)
         return dict(self._tasks[task_id])
 
     def _ensure_worker(self) -> None:
@@ -188,8 +195,10 @@ class TaskQueue:
                     run.cancel()
 
     async def _run(self, task: dict[str, Any]) -> None:
+        tid = task["id"]
         task["status"] = "running"
         self._save()
+        log.info("任务开始执行 task=%s", tid)
 
         # 0. 检查本地文件是否已存在（优先级最高）
         local_file = await self._check_local_file(task["url"], task.get("pwd"))
@@ -200,6 +209,7 @@ class TaskQueue:
             task["speed"] = None
             task["eta"] = None
             task["finished_at"] = _now()
+            log.info("任务完成（本地已存在，跳过下载） task=%s saved_to=%s", tid, local_file)
             # 标记为本地已有
             if not task.get("error"):
                 task["error"] = {
@@ -214,12 +224,13 @@ class TaskQueue:
         # 1. 智能下载：先尝试查找网盘中是否已存在该文件
         if self.enable_smart_download:
             existing_path = await self._find_existing_in_netdisk(task["url"], task.get("pwd"))
-            
+
             if existing_path:
                 # 标记：将跳过转存
                 task["will_skip_transfer"] = True
                 self._save()
-                
+                log.info("网盘已存在同名文件，跳过转存直接下载 task=%s pan_path=%s", tid, existing_path)
+
                 # 2. 直接从网盘下载（跳过转存）
                 success = await self._download_from_netdisk(task, existing_path)
                 if success:
@@ -228,7 +239,8 @@ class TaskQueue:
                 # 标记：将进行转存
                 task["will_skip_transfer"] = False
                 self._save()
-        
+                log.info("网盘中无同名文件，走转存后下载 task=%s", tid)
+
         # 3. 正常的转存 + 下载流程
         await self._download_from_share(task)
 
@@ -321,40 +333,32 @@ class TaskQueue:
             full_path = f"/apps/bdpan/{netdisk_path}"
             parent_dir = os.path.dirname(full_path)
             filename = os.path.basename(full_path)
-            
-            print(f"[网盘下载] 完整路径: {full_path}")
-            print(f"[网盘下载] 父目录: {parent_dir}, 文件名: {filename}")
-            
+
             ls_result = await self.bdpan.run("ls", [parent_dir], [])
             # ls 返回的是列表，不是字典
             items = ls_result if isinstance(ls_result, list) else []
-            
-            print(f"[网盘下载] ls 返回 {len(items)} 个项目")
-            
+
             filesize = None
             for item in items:
                 if item.get("server_filename") == filename or item.get("name") == filename:
                     filesize = item.get("size")
-                    print(f"[网盘下载] 找到文件，大小: {filesize}")
                     break
-            
+
             # 如果获取到大小，使用 size 目录
             if filesize is not None:
                 size_dir = os.path.join(self.download_dir, str(filesize))
                 os.makedirs(size_dir, exist_ok=True)
                 target = os.path.join(size_dir, "")
-                print(f"[网盘下载] 目标目录: {target}")
             else:
                 target = os.path.join(self.download_dir, "")
-                print(f"[网盘下载] 未获取到大小，使用根目录: {target}")
-        except Exception as e:
-            print(f"[网盘下载] 获取文件信息失败: {e}")
+        except Exception:
             target = os.path.join(self.download_dir, "")
         
         tail = ""
+        last_milestone = 0
 
         def on_output(text: str) -> None:
-            nonlocal tail
+            nonlocal tail, last_milestone
             text = tail + text
             for match in _PERCENT_RE.finditer(text):
                 value = min(int(match.group(1)), 99)
@@ -371,16 +375,16 @@ class TaskQueue:
                 task["total"] = _bytes(stats.group(3), stats.group(4))
                 task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
                 task["eta"] = _seconds(stats.group(8))
-            else:
-                # 调试：输出最后一行看看格式
-                last_line = text.strip().split('\n')[-1] if text.strip() else ""
-                if last_line and '%' in last_line:
-                    print(f"[调试] 未匹配的输出: {last_line}")
+            milestone = task["progress"] // 10 * 10
+            if milestone > last_milestone:
+                last_milestone = milestone
+                log.info("下载进度 task=%s progress=%s%%", task["id"], milestone)
             tail = re.split(r"[\r\n]", text)[-1][-512:]
             # 只有匹配到 stats 时才保存，减少 I/O
             if stats:
                 self._save()
 
+        log.info("开始下载（网盘直下） task=%s", task["id"])
         try:
             full_netdisk_path = f"/apps/bdpan/{netdisk_path}"
             data = await self.bdpan.run("download", [full_netdisk_path, target], [], on_output=on_output)
@@ -402,10 +406,12 @@ class TaskQueue:
             task["eta"] = None
             task["finished_at"] = _now()
             self._save()
+            log.info("任务完成（网盘直下） task=%s saved_to=%s", task["id"], task.get("saved_to"))
             return True
-        except Exception:
+        except Exception as err:
             # 下载失败，返回 False 继续正常流程
             task["progress"] = 0
+            log.warning("网盘直下失败，回退到转存流程 task=%s err=%s", task["id"], err)
             return False
 
     async def _download_from_share(self, task: dict[str, Any]) -> None:
@@ -456,9 +462,10 @@ class TaskQueue:
             target = os.path.join(self.download_dir, "")
         
         tail = ""
+        last_milestone = 0
 
         def on_output(text: str) -> None:
-            nonlocal tail
+            nonlocal tail, last_milestone
             text = tail + text
             for match in _PERCENT_RE.finditer(text):
                 value = min(int(match.group(1)), 99)
@@ -475,11 +482,10 @@ class TaskQueue:
                 task["total"] = _bytes(stats.group(3), stats.group(4))
                 task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
                 task["eta"] = _seconds(stats.group(8))
-            else:
-                # 调试：输出最后一行看看格式
-                last_line = text.strip().split('\n')[-1] if text.strip() else ""
-                if last_line and '%' in last_line:
-                    print(f"[调试] 未匹配的输出: {last_line}")
+            milestone = task["progress"] // 10 * 10
+            if milestone > last_milestone:
+                last_milestone = milestone
+                log.info("下载进度 task=%s progress=%s%%", task["id"], milestone)
             tail = re.split(r"[\r\n]", text)[-1][-512:]
             # 只有匹配到 stats 时才保存，减少 I/O
             if stats:
@@ -489,18 +495,23 @@ class TaskQueue:
         pwd = task.get("pwd")
         if pwd:
             flags += ["-p", pwd]
+        log.info("开始下载（转存后下载） task=%s target=%s", task["id"], target)
         try:
             data = await self.bdpan.run("download", [task["url"], target], flags, on_output=on_output)
         except BdpanError as err:
             task["status"] = "failed"
             task["error"] = {"code": err.kind, "message": err.message, "errno": err.errno, "hint": err.hint}
+            log.warning("任务失败 task=%s code=%s errno=%s message=%s",
+                        task["id"], err.kind, err.errno, err.message)
         except Exception as err:
             task["status"] = "failed"
             task["error"] = {"code": "internal", "message": f"{type(err).__name__}: {err}", "errno": None, "hint": None}
+            log.error("任务异常 task=%s message=%s", task["id"], task["error"]["message"])
         else:
             task["result"] = data
             if isinstance(data, dict) and data.get("status") == "submitted":
                 task["status"] = "submitted"
+                log.info("转存已提交，等待完成 task=%s", task["id"])
             else:
                 task["status"] = "done"
                 task["progress"] = 100
@@ -527,7 +538,8 @@ class TaskQueue:
                             # 创建 zip 压缩包
                             archive_path = os.path.join(target_dir, f"{archive_name}.zip")
                             
-                            print(f"[打包] 开始打包 {len(downloaded_items)} 个项目到 {archive_path}")
+                            log.info("开始打包 count=%s archive=%s task=%s",
+                                     len(downloaded_items), archive_path, task["id"])
                             
                             shutil.make_archive(
                                 os.path.join(target_dir, archive_name),
@@ -542,18 +554,21 @@ class TaskQueue:
                                 elif os.path.isdir(item_path):
                                     shutil.rmtree(item_path)
                             
-                            print(f"[打包] 完成，压缩包: {archive_path}")
+                            log.info("打包完成 archive=%s task=%s", archive_path, task["id"])
                             
                             # 更新任务信息
                             task["saved_to"] = os.path.join(os.path.basename(target_dir), f"{archive_name}.zip")
                             
                     except Exception as e:
-                        print(f"[打包] 失败: {e}")
+                        log.warning("打包失败 task=%s err=%s", task["id"], e)
                         # 打包失败不影响任务完成状态
         task["speed"] = None
         task["eta"] = None
         task["finished_at"] = _now()
         self._save()
+        if task["status"] == "done":
+            log.info("任务完成（转存后下载） task=%s saved_to=%s total=%s",
+                     task["id"], task.get("saved_to"), task.get("total"))
 
     def _fill_result(self, task: dict[str, Any], data: dict[str, Any]) -> None:
         items = [it for it in data.get("items") or [] if isinstance(it, dict)]

@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from pathlib import Path
@@ -39,6 +40,17 @@ def _parse_addr(addr: str) -> tuple[str, int]:
     return host or "0.0.0.0", int(port)
 
 
+def _configure_logging() -> None:
+    """配置应用与 uvicorn 日志统一输出到 stdout，供容器日志页读取。"""
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+
 def main() -> None:
     api_key = os.environ.get("BAIDU_EASY_API_KEY", "")
     if not api_key:
@@ -51,8 +63,10 @@ def main() -> None:
 
     import uvicorn
 
+    _configure_logging()
     app = create_app(api_key, bdpan_bin, download_dir=download_dir, tasks_file=tasks_file)
-    uvicorn.run(app, host=host, port=port)
+    # log_config=None：沿用 _configure_logging 配置的 stdout root logger，避免被 uvicorn 重置到 stderr
+    uvicorn.run(app, host=host, port=port, log_config=None)
 
 
 if __name__ == "__main__":

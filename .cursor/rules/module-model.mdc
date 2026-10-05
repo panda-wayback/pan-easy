@@ -1,0 +1,17 @@
+---
+description: Module 的定义、接口与黑盒调用方式
+alwaysApply: true
+---
+# Module 模型
+
+- Module 是最小开发单位：一个含 `interface.yaml`（接口）的目录。
+- 接口 = Input + Output + Contract + errors；与其它文档冲突时以 `interface.yaml` 为准。
+- 根目录 `interface.yaml` 是顶层 Module；各级 `modules` 登记子 Module，用于逐级定位。
+- 未登记的目录和文件属于最近的上级 Module。
+
+## 黑盒
+
+- Module 的实现可以调用其它 Module，只能通过对方接口调用；禁止使用对方接口之外的内部实现。
+- 接口必须足以直接调用：不读实现即可知道调用名、输入格式、输出格式与行为。
+- 所有直接调用的 Module 写入 `depends`；禁止循环依赖。
+- 测试未通过的 Module 不得被其它 Module 调用。

@@ -1,0 +1,24 @@
+---
+description: 按 Module 定位、实现、测试的流程与读取范围
+alwaysApply: true
+---
+# Module 开发流程
+
+0. 需求分析：新功能或修改功能时，先写或改 `docs/` 功能页，用户确认方案后才能进入后续步骤；修 Bug、重构、补测试跳过本步。
+1. 定位：从根 `interface.yaml` 的 `modules` 逐级找到要修改的 Module。
+2. 复用：先查现有 Module 的接口能否满足需求；能满足则直接调用，禁止另写重复实现。
+3. 设计：需新建 Module 或改接口时，先写 `interface.yaml`，再写实现；新 Module 登记到上级 `modules`。
+4. 实现：只读写要修改的 Module 的实现；调用其它 Module 只读其 `interface.yaml`。
+5. 测试：通过 Input 调用、检查 Output 与 Contract，不测内部实现；测试放在本 Module 目录内，必须全部通过。
+6. 集成：多个 Module 串联的验证写在上级 Module 的 `tests` 与测试中，涉及时运行并通过。
+
+## 读取范围
+
+- 禁止扫描整个项目或阅读无关 Module 的实现。
+- 只有要修改某个 Module 时才读它的实现。
+- 其它 Module 的接口不足以调用时，视为修改该 Module：读其实现并补全其 `interface.yaml`。
+
+## 修改影响
+
+- 改接口：先搜索各 `interface.yaml` 的 `depends` 找出调用方；同一轮更新本 Module 的 `interface.yaml` 与测试、调用方及其测试、引用该接口的文档。
+- 只改实现：调用方无需改动；运行本 Module 测试。
