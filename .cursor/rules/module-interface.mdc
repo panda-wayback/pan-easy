@@ -13,7 +13,7 @@ alwaysApply: false
 | `input` | 是 | 列表：`name` 写对外调用名（函数、HTTP 接口、消息等），`type` 写输入数据格式，`desc` 写含义；无则 `[]` |
 | `output` | 是 | 列表：`name` 写对应的调用名，`type` 写输出数据格式，`desc` 写含义；无则 `[]` |
 | `contract` | 是，非空 | 调用方可观察到的行为保证、边界条件、不变式 |
-| `depends` | 是 | 直接调用的 Module，写仓库根相对路径；无则 `[]` |
+| `depends` | 是 | 直接调用的 Module，写仓库根相对路径；仓库外依赖写 `ext:<名称>`；无则 `[]` |
 | `errors` | 否 | `code` / `desc` 列表 |
 | `tests` | 是，非空 | 通过 Input / Output 验证的测试用例；有子 Module 时写 Integration Test |
 

@@ -5,4 +5,4 @@
 !requirements.txt
 !entrypoint.sh
 **/__pycache__
-**/spec.yaml
+**/interface.yaml
