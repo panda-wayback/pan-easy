@@ -18,7 +18,9 @@ alwaysApply: false
 | `.cursor/rules/skill-writing.mdc` | 自维护 Skill 写法 |
 | `.cursor/skills/doc-node-graph/` | `docs/` 怎么写、怎么推进 |
 | `.cursor/skills/pseudo-software/` | 伪软件：拆模块、落成 `spec.yaml` |
-| `.cursor/skills/ui-ux-pro-max/` | UI/UX 设计辅助（导入 Skill，原样拷贝） |
+| `.agents/skills/ui-ux-pro-max/`（导入 Skill；用时拷入 `.cursor/skills/`） | UI/UX 设计辅助 |
+
+`.agents/skills/` 同为通用包目录，存放导入型 Skill（上游维护、原样拷入）；用时拷到 `.cursor/skills/`。
 
 另属通用、但不靠「拷贝旧仓正文」获得：
 
@@ -102,15 +104,15 @@ alwaysApply: false
 
 ### 测试优化策略
 
-10. **增量测试优先**：先测小范围（单测）→ 再测模块 → 最后全量
-11. **限制测试输出**：添加参数限制日志详细程度或只显示摘要
-12. **设置合理超时**：命令超时设置 10-30 秒，避免长时间等待
-13. **失败后换方法**：测试/诊断失败后分析原因，不要立即重跑相同步骤
+11. **增量测试优先**：先测小范围（单测）→ 再测模块 → 最后全量
+12. **限制测试输出**：添加参数限制日志详细程度或只显示摘要
+13. **设置合理超时**：命令超时设置 10-30 秒，避免长时间等待
+14. **失败后换方法**：测试/诊断失败后分析原因，不要立即重跑相同步骤
 
 ### Token 记账
 
-14. **大操作前评估**：读取 >200 行或运行 >20 秒的操作前，先评估是否必要
-15. **避免重复诊断**：同一问题出现两次，换思路而不是重复相同的调查
+15. **大操作前评估**：读取 >200 行或运行 >20 秒的操作前，先评估是否必要
+16. **避免重复诊断**：同一问题出现两次，换思路而不是重复相同的调查
 
 **示例（按复杂度分级）**：
 
@@ -188,6 +190,6 @@ docs/
 |---|---|
 | 探讨方案、写/改 docs、选下一步 | `.cursor/skills/doc-node-graph/SKILL.md` |
 | 进入模块设计、改模块契约、写/审 `spec.yaml` | `.cursor/skills/pseudo-software/SKILL.md` |
-| UI/UX 设计、改界面观感、配色排版动效 | `.cursor/skills/ui-ux-pro-max/SKILL.md` |
+| UI/UX 设计、改界面观感、配色排版动效 | `.agents/skills/ui-ux-pro-max/SKILL.md`（先拷入 `.cursor/skills/` 再用） |
 
 产品正文只写在 `docs/`，禁止写进 Skill。细则以 Skill 正文为准；本文件只调度。

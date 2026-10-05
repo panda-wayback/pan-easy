@@ -14,7 +14,12 @@ _SHARE_RE = re.compile(r"https?://pan\.baidu\.com/s/[A-Za-z0-9_\-]+(?:\?[A-Za-z0
 _PWD_TEXT_RE = re.compile(r"提取码\s*[:：]?\s*([A-Za-z0-9]{4})")
 _PERCENT_RE = re.compile(r"(\d{1,3})(?:\.\d+)?%")
 # 修复：匹配 (8.8/12 MB, 82 kB/s) [1m50s:35s] 格式
-_STATS_RE = re.compile(r"\(\s*([\d.]+)/([\d.]+)\s*([kMGTP]?B)(?:,\s*([\d.]+)\s*([kMGTP]?B)/s)?\s*\)\s*\[[^:\]]*:([^\]]*)\]")
+# 匹配 (98 kB/6.6 MB, 89 kB/s) [0s:1m12s]：已下载/总量各带单位，速度可缺省；兼容共享单位 (8.8/12 MB)
+_STATS_RE = re.compile(
+    r"\(\s*([\d.]+)\s*([kMGTP]?B)?/([\d.]+)\s*([kMGTP]?B)"
+    r"(?:,\s*([\d.]+)\s*([kMGTP]?B)/s)?"
+    r"\s*\)\s*\[([^:\]]*):([^\]]*)\]"
+)
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
 _UNITS = {"B": 1, "kB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4, "PB": 1000**5}
 _DURATION_UNITS = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
@@ -129,28 +134,11 @@ class TaskQueue:
         return True
 
     def retry(self, task_id: str) -> Optional[dict[str, Any]]:
-        """重试失败或中断的任务（恢复原任务，支持断点续传）"""
+        """重试失败或中断的任务：复制原分享链接与提取码，新建任务 ID 排队；原记录保留。"""
         task = self._tasks.get(task_id)
         if task is None or task["status"] not in ("failed", "interrupted"):
             return None
-        
-        # 重置任务状态，保留任务 ID
-        task.update(
-            status="queued",
-            progress=0,
-            speed=None,
-            eta=None,
-            error=None,
-            finished_at=None,
-            will_skip_transfer=None,  # 重置智能下载标记
-        )
-        # 注意：不重置 downloaded, total - 保留下载进度信息
-        # 不重置 saved_to - 保留目标路径，bdpan 可能检测部分文件
-        
-        self._save()
-        self._ensure_worker()
-        self._queue.put_nowait(task_id)
-        return dict(task)
+        return self._add(task["url"], task.get("pwd"))
 
     def _add(self, url: str, pwd: Optional[str]) -> dict[str, Any]:
         task_id = uuid.uuid4().hex[:12]
@@ -376,17 +364,13 @@ class TaskQueue:
             for stats in _STATS_RE.finditer(text):
                 pass
             if stats:
-                # 新格式：(8.8/12 MB, 82 kB/s) [1m50s:35s]
-                # group(1): 8.8 (已下载数值)
-                # group(2): 12 (总大小数值)
-                # group(3): MB (共享单位)
-                # group(4): 82 (速度数值)
-                # group(5): kB (速度单位)
-                # group(6): 35s (剩余时间)
-                task["downloaded"] = _bytes(stats.group(1), stats.group(3))
-                task["total"] = _bytes(stats.group(2), stats.group(3))
-                task["speed"] = _bytes(stats.group(4), stats.group(5)) if stats.group(4) else None
-                task["eta"] = _seconds(stats.group(6))
+                # (98 kB/6.6 MB, 89 kB/s) [0s:35s]：各带单位；已下载单位缺省（共享单位）时回退用总量单位
+                # 1,2=已下载值,单位 3,4=总量值,单位 5,6=速度值,单位 7=已用 8=剩余
+                dl_unit = stats.group(2) or stats.group(4)
+                task["downloaded"] = _bytes(stats.group(1), dl_unit)
+                task["total"] = _bytes(stats.group(3), stats.group(4))
+                task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
+                task["eta"] = _seconds(stats.group(8))
             else:
                 # 调试：输出最后一行看看格式
                 last_line = text.strip().split('\n')[-1] if text.strip() else ""
@@ -484,17 +468,13 @@ class TaskQueue:
             for stats in _STATS_RE.finditer(text):
                 pass
             if stats:
-                # 新格式：(8.8/12 MB, 82 kB/s) [1m50s:35s]
-                # group(1): 8.8 (已下载数值)
-                # group(2): 12 (总大小数值)
-                # group(3): MB (共享单位)
-                # group(4): 82 (速度数值)
-                # group(5): kB (速度单位)
-                # group(6): 35s (剩余时间)
-                task["downloaded"] = _bytes(stats.group(1), stats.group(3))
-                task["total"] = _bytes(stats.group(2), stats.group(3))
-                task["speed"] = _bytes(stats.group(4), stats.group(5)) if stats.group(4) else None
-                task["eta"] = _seconds(stats.group(6))
+                # (98 kB/6.6 MB, 89 kB/s) [0s:35s]：各带单位；已下载单位缺省（共享单位）时回退用总量单位
+                # 1,2=已下载值,单位 3,4=总量值,单位 5,6=速度值,单位 7=已用 8=剩余
+                dl_unit = stats.group(2) or stats.group(4)
+                task["downloaded"] = _bytes(stats.group(1), dl_unit)
+                task["total"] = _bytes(stats.group(3), stats.group(4))
+                task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
+                task["eta"] = _seconds(stats.group(8))
             else:
                 # 调试：输出最后一行看看格式
                 last_line = text.strip().split('\n')[-1] if text.strip() else ""

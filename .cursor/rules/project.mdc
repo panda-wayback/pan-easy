@@ -1,0 +1,73 @@
+---
+description: >-
+  baidu-easy 本仓硬约束：FastAPI 模块边界、统一响应、替身测试、安全与 Docker 契约。
+  仅本仓有效，禁止复制他仓；与 spec.yaml 冲突时以 spec 为准并先修本文件。
+globs:
+  - app/**
+  - tests/**
+  - templates/**
+  - web/**
+  - Dockerfile
+  - entrypoint.sh
+  - compose.yaml
+  - Makefile
+alwaysApply: false
+---
+
+# baidu-easy 本仓硬约束
+
+产品目标以 `docs/README.md` 为准；模块契约以根 `spec.yaml` 与各模块 `spec.yaml` 为准。
+
+## 技术栈
+
+1. Python 3.13（镜像 `python:3.13-slim`）；FastAPI + uvicorn + Jinja2 + python-multipart，版本锁定在 `requirements.txt`。
+2. 禁止前端构建流程、外部 CDN、npm 系依赖；网页为 `templates/` Jinja2 页 + `web/static/` 原生静态资源。
+3. 新增运行时依赖加 `requirements.txt` 并锁定版本；仅测试用加 `requirements-dev.txt`。禁止使用未声明的第三方库。
+
+## 模块边界
+
+4. 依赖方向单向，禁止反向 import：
+   - `app/bdpan`：适配 bdpan CLI，无内部依赖；出口 `Bdpan`、`BdpanError`
+   - `app/tasks`：任务队列，只依赖 `app/bdpan`；出口 `TaskQueue`、`NoShareLink`
+   - `app/api`：HTTP 层，依赖 bdpan 与 tasks；工厂 `create_api`、`create_dl`
+   - `app/webui.py`：网页层（Jinja2 + HttpOnly Cookie，兼容 Bearer），与 api 平级，最后挂载作页面兜底
+   - `app/main.py`：只做组装与 env 读取；工厂 `create_app`
+5. 禁止在适配层之外直接 subprocess 调 bdpan；禁止 api 之外的模块读 HTTP 请求。
+6. 每个模块一个目录、一个 `spec.yaml`；新增模块先写 spec 再写代码。
+
+## HTTP 与响应
+
+7. 所有 `/api/*` 必须校验 `Authorization: Bearer <key>`，常量时间比较；`/dl/*` 凭 HMAC 签名与有效期放行，不验密钥。
+8. 统一 JSON 响应只准两种：
+   - 成功 `{"ok": true, "data": ...}`（`_ok`），data 透传 bdpan 结果
+   - 失败 `{"ok": false, "error": {"code", "message", "errno?", "hint?"}}`（`_error_response`）
+9. 网盘路径为相对“我的应用数据/bdpan”的相对路径；含 `..` 或以 `/`、`~` 开头一律拒绝。
+10. 错误码与 HTTP 状态映射按 `app/api/spec.yaml`（401/400/404/409/502/504/500）；禁止自创 code。
+11. 后台任务提交成功返回 202 与 task_id，禁止冒充完成态。
+12. 响应与日志中禁止出现 Token、bdpan 配置内容、授权码。
+
+## 安全与临时文件
+
+13. 授权码只经 stdin 传给 bdpan，禁止进进程参数；白名单外子命令不启动进程；参数以数组传递，禁止拼 shell。
+14. 上传、下载经 TMPDIR 临时文件中转；请求结束（成功 / 失败 / 客户端断开）后临时文件必须删除。
+15. 凭据只写入 `/data/bdpan`，任务历史只写入 `/data/tasks.json`，禁止写他处。
+16. `/dl` 只读取下载目录内文件；解析后路径逃逸出下载目录一律拒绝。
+
+## 测试
+
+17. 默认 pytest（`make test`）禁止真实 bdpan、真实账号、真实网络与 Docker；bdpan 一律替换身：`tests/fake_bdpan.py` + `fake_bin` fixture。
+18. 新接口 / 新错误码必须同时加测试：参数校验、到 bdpan 子命令参数的映射、错误到 HTTP 状态码的映射。
+19. 改完按增量顺序验证：相关单测 → `make test` 全量；失败先分析原因，禁止盲目重跑。
+20. spec 中的 Integration Test（真账号、双平台镜像）属人工验收，不写进默认 pytest。
+
+## Docker / 部署
+
+21. 容器以非 root 运行（uid 1000，用户 app）；entrypoint 先 chown `/data` `/downloads`，再 setpriv 降权启动。
+22. bdpan 版本与双架构 SHA256 固定为 Dockerfile ARG；校验失败必须构建失败；升级 bdpan = 改版本与哈希后重建镜像，禁止运行时更新。
+23. 只声明 `/data`、`/downloads` 两个卷；必须支持 linux/amd64 与 linux/arm64。
+24. 未配置 `BAIDU_EASY_API_KEY` 时必须打印原因并以非零码退出。
+25. 配置 env 统一 `BAIDU_EASY_*` 前缀（bdpan 自身配置用 `BDPAN_*`）；新增配置必须同步根 `spec.yaml` 的 input。
+
+## 变更顺序
+
+26. 契约变化先改对应 `spec.yaml`（必要时走方案先行改 docs）→ 再改代码与测试；禁止只改代码留下过期契约。

@@ -1,0 +1,38 @@
+---
+description: >-
+  Module 驱动开发（MDD）：以 spec.yaml 登记的 Module 为最小单位理解、复用、修改、测试；Contract 优先于源码。
+  触发：实现需求、修 Bug、改 Module、Debug、组合 Module、评估变更影响。
+alwaysApply: false
+---
+
+# Module 驱动开发
+
+## 单位
+
+1. Module 是最小开发单位；禁止以文件 / 函数 / Class 作为理解项目的主要单位。
+2. Module = 父级 `spec.yaml` 的 `modules` 中登记的目录；Input / Output / Contract / Dependencies / Test 只写在该模块自己的 `spec.yaml`，与编程语言无关。
+3. `spec.yaml` 是理解 Module 的唯一入口；实现代码只是 Contract 的实现。未读 Contract 前禁止通读源码。
+
+## 理解与定位
+
+4. 任何开发任务先定位 Module：根 `spec.yaml` 的 `modules`（项目地图）→ 相关模块 `spec.yaml` 的 Contract → 必要时才精确读取实现；调查细则遵 `workflow.mdc`。
+5. 禁止为小需求无目的扫描整个项目；阅读范围由 Module 界定。
+
+## 复用优先
+
+6. 先判断已有 Module 能否满足需求；能复用禁止新建代码。
+7. 现有 Module 不满足 → 先按 `pseudo-software` Skill 设计或修改 Module（五要素 + 独立测试），经用户裁定并落入 `spec.yaml` 后再写实现；禁止先写代码。
+
+## 边界与变更
+
+8. Module 之间只经公开 Input / Output / Contract 组合；禁止依赖其它 Module 的内部实现或私有符号。
+9. 修改 Module 前先查 `depends`，评估对下游 Module 的影响；Contract 变更顺序：先改 `spec.yaml` 与受影响下游 → 再改代码与测试；禁止留下过期契约。
+
+## 测试门禁
+
+10. 每个 Module 必须有独立测试；独立测试通过后，该 Module 才允许被其它 Module 组合使用。
+11. 组合后必须跑组合 / Integration Test；本仓 pytest 约束（替身、禁真实网络）遵 `project.mdc`。
+
+## 标准流程
+
+12. 需求 → 定位 Module → 理解 Contract → 复用判断 → 必要时设计 / 修改 Module（裁定）→ 实现 → Module Test 通过 → 组合 → Integration Test。
