@@ -27,11 +27,13 @@ ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 WORKDIR /srv
 COPY requirements.txt .
-RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r requirements.txt
+COPY shop/requirements.txt shop/requirements.txt
+RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r requirements.txt -r shop/requirements.txt
 
 COPY app ./app
 COPY web ./web
 COPY templates ./templates
+COPY shop ./shop
 
 RUN useradd --create-home --uid 1000 app \
     && mkdir -p /data/bdpan /downloads \
@@ -41,10 +43,12 @@ ENV BDPAN_CONFIG_DIR=/data/bdpan \
     BAIDU_EASY_ADDR=:8080 \
     BAIDU_EASY_DOWNLOAD_DIR=/downloads \
     BAIDU_EASY_TASKS_FILE=/data/tasks.json \
+    SHOP_ADDR=:8081 \
+    BAIDU_EASY_URL=http://127.0.0.1:8080 \
     PYTHONUNBUFFERED=1
 
 VOLUME ["/data", "/downloads"]
-EXPOSE 8080
+EXPOSE 8080 8081
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

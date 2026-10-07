@@ -211,8 +211,8 @@ def main() -> None:
     if not api_key or not auth_url:
         print("shop: 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL，拒绝启动", file=sys.stderr)
         sys.exit(1)
-    host, port = _parse_addr(os.environ.get("SHOP_ADDR", ":8080"))
-    upstream = os.environ.get("BAIDU_EASY_URL", "http://baidu-easy:8080")
+    host, port = _parse_addr(os.environ.get("SHOP_ADDR", ":8081"))
+    upstream = os.environ.get("BAIDU_EASY_URL", "http://127.0.0.1:8080")
 
     import uvicorn
 

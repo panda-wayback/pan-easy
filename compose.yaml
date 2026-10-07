@@ -5,26 +5,15 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:28080:8080"
+      - "28081:8081"
     environment:
       BAIDU_EASY_API_KEY: ${BAIDU_EASY_API_KEY:?请先设置 BAIDU_EASY_API_KEY}
-    volumes:
-      - baidu-easy-data:/data
-      - ./downloads:/downloads
-
-  shop:
-    build: ./shop
-    image: baidu-easy-shop:latest
-    restart: unless-stopped
-    depends_on:
-      - baidu-easy
-    ports:
-      - "28081:8080"
-    environment:
-      BAIDU_EASY_API_KEY: ${BAIDU_EASY_API_KEY:?请先设置 BAIDU_EASY_API_KEY}
-      BAIDU_EASY_URL: http://baidu-easy:8080
       SPARK_AUTH_URL: ${SPARK_AUTH_URL:-http://host.docker.internal:8000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - baidu-easy-data:/data
+      - ./downloads:/downloads
 
 volumes:
   baidu-easy-data:

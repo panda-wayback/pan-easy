@@ -33,19 +33,24 @@ input:
   - name: TMPDIR
     type: env string
     desc: 上传、下载临时文件目录；默认系统临时目录
+  - name: SPARK_AUTH_URL
+    type: env string
+    desc: 镜像内 shop 使用的 spark-auth 卡密服务地址；容器必填（见 shop/interface.yaml）
 output:
   - name: http
     type: HTTP service
     desc: 在监听地址上提供 /api/* 接口、下载链接 /dl/* 与测试网页 /
   - name: image
     type: Docker image
-    desc: 包含服务程序与固定版本 bdpan 的镜像
+    desc: 包含服务程序、shop 与固定版本 bdpan 的镜像；容器内 8080 为 API 服务，8081 为 shop
 contract:
   - 未配置 BAIDU_EASY_API_KEY 时拒绝启动并输出原因
   - 镜像内 bdpan 版本固定，构建时校验 SHA256，校验失败则构建失败
   - 镜像内不包含任何 bdpan 凭据；/data 为持久卷，bdpan 配置只写入 /data/bdpan，任务历史写入 /data/tasks.json
   - /downloads 为下载目录卷；compose 将宿主机 ./downloads 挂载到 /downloads
-  - compose 中 baidu-easy 端口只绑定宿主机 127.0.0.1；对外只暴露 shop 端口，shop 经内部网络访问 baidu-easy
+  - 容器内同时运行 API 服务（8080）与 shop（8081），shop 经 127.0.0.1:8080 调用 API 服务；任一进程退出时另一进程被停止、容器退出
+  - 容器未配置 SPARK_AUTH_URL 时 shop 拒绝启动并输出原因，容器随之退出
+  - compose 中 8080 只绑定宿主机 127.0.0.1；对外只暴露 8081
   - 容器以非 root 用户运行
   - 支持 linux/amd64 与 linux/arm64
   - 不提供 bdpan 更新能力；升级 bdpan 只通过重建镜像
@@ -56,9 +61,10 @@ depends:
   - ext:docker
 errors:
   - code: config_missing
-    desc: 未配置访问密钥；进程以非零码退出
+    desc: 未配置访问密钥（或容器内未配置 SPARK_AUTH_URL）；进程以非零码退出
 tests:
   - 独立测试：缺少访问密钥时进程拒绝启动；两个平台的镜像都能构建，容器内 bdpan 版本与固定版本一致
+  - 容器测试：启动后 8080 返回测试网页、8081 返回 shop 网页，经 8081 提交走通 spark-auth；未配置 SPARK_AUTH_URL 时容器退出；停掉任一进程容器退出
   - 组合测试：服务连同替身 bdpan 启动，获取测试网页后带密钥依次调用登录、列表、上传、下载、删除，检查统一响应格式，结束后临时目录为空；粘贴分享文字提交任务，轮询到完成，文件出现在下载目录
   - 组合测试：shop 连同服务、替身 bdpan 与替身 spark-auth 运行，带卡密经 shop 提交任务并返回剩余次数，经专属页面轮询到完成、生成链接，链接域名为 shop 的域名，经 shop 下载内容一致
   - Integration Test：真实账号，构建并启动容器 → 通过测试网页登录 → 在 我的应用数据/bdpan/baidu-easy-test/ 下完成 上传 → 列表 → 下载比对内容 → 分享 → 删除 → 重建容器后登录状态与任务历史仍在；用真实分享链接完成一次分享下载，核对下载目录中文件大小

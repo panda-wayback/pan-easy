@@ -4,5 +4,7 @@
 !templates/
 !requirements.txt
 !entrypoint.sh
+!shop/
+shop/tests/
 **/__pycache__
 **/interface.yaml

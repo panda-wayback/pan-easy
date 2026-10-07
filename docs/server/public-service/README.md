@@ -18,11 +18,11 @@
 
 ## 方案
 
-- 新增：Module `shop`，独立服务（Python + FastAPI，独立镜像）：提供网页与任务接口；提交时服务器端先调用 spark-auth 核销接口 `POST /api/redeem` 扣 1 次，成功后再用主密钥调用 baidu-easy 创建任务
+- 新增：Module `shop`，独立进程（Python + FastAPI，与 baidu-easy 打包在同一镜像，见 [Docker 镜像](../image/README.md)）：提供网页与任务接口；提交时服务器端先调用 spark-auth 核销接口 `POST /api/redeem` 扣 1 次，成功后再用主密钥调用 baidu-easy 创建任务
 - 复用：`app/api` 的 `POST /api/tasks`、`GET /api/tasks/{id}`、`POST /api/tasks/{id}/link`、`GET|HEAD /dl/{id}`
 - 配置：`SPARK_AUTH_URL` 为 spark-auth 服务地址；本地调试时 shop 在容器内，填 `http://host.docker.internal:8000`
-- 部署：compose 中 baidu-easy 端口只绑定 `127.0.0.1`，管理页只在服务器本机或 SSH 隧道访问；shop 对外暴露 28081，经内部网络访问 baidu-easy
-- 取舍：独立服务而非在 baidu-easy 内加公开页或双端口，baidu-easy 保持不变，卡密、用户隔离都只改 shop
+- 部署：容器内 8080 为管理页，compose 只绑定 `127.0.0.1:28080`；8081 为 shop，对外暴露 28081
+- 取舍：shop 是独立进程而非在 baidu-easy 内加公开页，baidu-easy 代码保持不变，卡密、用户隔离都只改 shop
 - 取舍：用按次数卡密而非设备激活卡密：网页读不到设备硬件标识，按次数不绑定设备，与「下载一次」的售卖方式一致
 - 取舍：先核销再创建任务（spark-auth 规定）；核销前只检查文字中有 `pan.baidu.com/s/` 链接，链接失效、提取码错误等要下载时才知道，任务失败不退次数
 - 取舍：剩余次数随提交结果记在浏览器历史里，专属页面从本浏览器历史读取；在别的浏览器打开专属页面时不显示

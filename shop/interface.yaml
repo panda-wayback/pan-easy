@@ -7,13 +7,13 @@ input:
     desc: baidu-easy 主密钥，只在服务器端使用，同时用于专属页面凭证签名；必填
   - name: BAIDU_EASY_URL
     type: env string
-    desc: baidu-easy 内部地址；默认 http://baidu-easy:8080
+    desc: baidu-easy 地址；默认 http://127.0.0.1:8080（同一容器内的 API 服务）
   - name: SPARK_AUTH_URL
     type: env string
     desc: spark-auth 卡密服务地址，如 http://host.docker.internal:8000；必填
   - name: SHOP_ADDR
     type: env string
-    desc: 监听地址；默认 :8080
+    desc: 监听地址；默认 :8081
   - name: GET /
     type: 无参数
     desc: 首页
