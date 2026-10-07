@@ -31,7 +31,6 @@ RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r requirements.txt
 
 COPY app ./app
 COPY web ./web
-COPY web-public ./web-public
 COPY templates ./templates
 
 RUN useradd --create-home --uid 1000 app \

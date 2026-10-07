@@ -1,7 +1,6 @@
 *
 !app/
 !web/
-!web-public/
 !templates/
 !requirements.txt
 !entrypoint.sh

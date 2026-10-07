@@ -9,8 +9,8 @@ modules:
     function: HTTP 接口：鉴权、参数校验、调用 bdpan 适配、统一 JSON 响应、文件流传输
   - path: web
     function: 测试网页：分享下载与登录
-  - path: web-public
-    function: 公开下载页：粘贴分享链接下载、查看进度、获取下载链接
+  - path: shop
+    function: 对外下载服务：凭访问密钥提交分享下载，每次提交生成 24 小时有效的专属页面查看进度与获取下载链接，服务器端调用 baidu-easy
 input:
   - name: BAIDU_EASY_API_KEY
     type: env string
@@ -36,7 +36,7 @@ input:
 output:
   - name: http
     type: HTTP service
-    desc: 在监听地址上提供 /api/* 接口、下载链接 /dl/*、测试网页 / 与公开下载页 /public
+    desc: 在监听地址上提供 /api/* 接口、下载链接 /dl/* 与测试网页 /
   - name: image
     type: Docker image
     desc: 包含服务程序与固定版本 bdpan 的镜像
@@ -45,13 +45,14 @@ contract:
   - 镜像内 bdpan 版本固定，构建时校验 SHA256，校验失败则构建失败
   - 镜像内不包含任何 bdpan 凭据；/data 为持久卷，bdpan 配置只写入 /data/bdpan，任务历史写入 /data/tasks.json
   - /downloads 为下载目录卷；compose 将宿主机 ./downloads 挂载到 /downloads
+  - compose 中 baidu-easy 端口只绑定宿主机 127.0.0.1；对外只暴露 shop 端口，shop 经内部网络访问 baidu-easy
   - 容器以非 root 用户运行
   - 支持 linux/amd64 与 linux/arm64
   - 不提供 bdpan 更新能力；升级 bdpan 只通过重建镜像
 depends:
   - app/api
   - web
-  - web-public
+  - shop
   - ext:docker
 errors:
   - code: config_missing
@@ -59,4 +60,5 @@ errors:
 tests:
   - 独立测试：缺少访问密钥时进程拒绝启动；两个平台的镜像都能构建，容器内 bdpan 版本与固定版本一致
   - 组合测试：服务连同替身 bdpan 启动，获取测试网页后带密钥依次调用登录、列表、上传、下载、删除，检查统一响应格式，结束后临时目录为空；粘贴分享文字提交任务，轮询到完成，文件出现在下载目录
+  - 组合测试：shop 连同服务与替身 bdpan 运行，带访问密钥经 shop 提交任务，经专属页面轮询到完成、生成链接，链接域名为 shop 的域名，经 shop 下载内容一致
   - Integration Test：真实账号，构建并启动容器 → 通过测试网页登录 → 在 我的应用数据/bdpan/baidu-easy-test/ 下完成 上传 → 列表 → 下载比对内容 → 分享 → 删除 → 重建容器后登录状态与任务历史仍在；用真实分享链接完成一次分享下载，核对下载目录中文件大小

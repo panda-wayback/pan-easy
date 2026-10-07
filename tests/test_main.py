@@ -30,14 +30,6 @@ def test_serves_web_page_without_key(fake_bin, tmp_path):
     assert "baidu-easy" in res.text
 
 
-def test_serves_public_page(fake_bin, tmp_path):
-    client = TestClient(create_app(KEY, fake_bin, download_dir=str(tmp_path / "dl")))
-    res = client.get("/public")
-    assert res.status_code == 200
-    assert "text/html" in res.headers["content-type"]
-    assert "网盘文件下载" in res.text
-
-
 def test_combined_flow(fake_bin, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_BDPAN_STORE", str(tmp_path / "drive"))
     work = tmp_path / "work"
@@ -109,6 +101,36 @@ def _combined_flow(client, work, downloads):
     assert client.get(url).content == b"shared-content"
 
     assert list(work.iterdir()) == []
+
+
+def test_shop_flow(fake_bin, tmp_path, monkeypatch):
+    import httpx
+
+    from shop.app import create_app as create_shop
+
+    monkeypatch.setenv("FAKE_BDPAN_STORE", str(tmp_path / "drive"))
+    (tmp_path / "drive.login").touch()
+    downloads = tmp_path / "downloads"
+    easy = create_app(KEY, fake_bin, download_dir=str(downloads))
+    shop = create_shop("shop-key", KEY, "http://baidu-easy", transport=httpx.ASGITransport(app=easy))
+    auth = {"Authorization": "Bearer shop-key"}
+
+    with TestClient(shop, base_url="http://shop.example") as client:
+        assert client.get("/tasks", headers=AUTH).status_code == 401
+        res = client.post("/tasks", json={"text": "链接：https://pan.baidu.com/s/1abc?pwd=PhPR"}, headers=auth)
+        assert res.status_code == 202
+        task_id, page = res.json()["data"]["id"], res.json()["data"]["page"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            task = client.get(f"{page}/task").json()["data"]
+            if task["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.05)
+        assert task["status"] == "done", task
+
+        url = client.post(f"{page}/link").json()["data"]["url"]
+        assert url.startswith(f"http://shop.example/dl/{task_id}?") and KEY not in url
+        assert client.get(url).content == b"shared-content"
 
 
 def _task(task_id, status="done", saved_to=None):

@@ -1,0 +1,90 @@
+name: shop
+function: 对外下载服务：凭访问密钥提交分享下载，每次提交生成 24 小时有效的专属页面查看进度与获取下载链接，服务器端调用 baidu-easy
+modules: []
+input:
+  - name: SHOP_ACCESS_KEY
+    type: env string
+    desc: 用户使用的访问密钥；必填
+  - name: BAIDU_EASY_API_KEY
+    type: env string
+    desc: baidu-easy 主密钥，只在服务器端使用，同时用于专属页面凭证签名；必填
+  - name: BAIDU_EASY_URL
+    type: env string
+    desc: baidu-easy 内部地址；默认 http://baidu-easy:8080
+  - name: SHOP_ADDR
+    type: env string
+    desc: 监听地址；默认 :8080
+  - name: GET /
+    type: 无参数
+    desc: 首页
+  - name: POST /tasks
+    type: header "Authorization: Bearer <SHOP_ACCESS_KEY>"；JSON {text}
+    desc: 提交分享文字，创建下载任务并生成专属页面
+  - name: GET /t/{token}
+    type: path token
+    desc: 专属页面
+  - name: GET /t/{token}/task
+    type: path token
+    desc: 专属页面对应的任务
+  - name: POST /t/{token}/link
+    type: path token
+    desc: 为专属页面对应的完成单文件任务生成下载链接
+  - name: GET|HEAD /dl/{id}
+    type: path id；query exp, sig；header Range?
+    desc: 用下载链接下载任务文件
+output:
+  - name: GET /、GET /t/{token}
+    type: text/html
+    desc: 同一个单文件自包含网页，不依赖外部 CDN；只调用本服务接口
+  - name: POST /tasks
+    type: JSON
+    desc: 成功时为 baidu-easy POST /api/tasks 的响应，data 额外带 page（专属页面路径 /t/{token}）与 page_expires_at（ISO 8601）；失败时与 baidu-easy 的状态码与响应体一致
+  - name: GET /t/{token}/task
+    type: JSON
+    desc: 与 baidu-easy GET /api/tasks/{id} 的状态码与响应体一致（任务格式见 app/tasks/interface.yaml）
+  - name: POST /t/{token}/link
+    type: JSON
+    desc: 与 baidu-easy POST /api/tasks/{id}/link 的状态码与响应体一致；url 指向本服务域名
+  - name: GET|HEAD /dl/{id}
+    type: application/octet-stream
+    desc: 与 baidu-easy /dl/{id} 的状态码、响应头与内容一致，支持 Range 断点续传
+  - name: failure
+    type: JSON {ok:false, error:{code, message}}
+    desc: 本服务自身的错误，code 取值见 errors
+contract:
+  - 未配置 SHOP_ACCESS_KEY 或 BAIDU_EASY_API_KEY 时拒绝启动并输出原因
+  - POST /tasks 校验访问密钥，比较使用常量时间；不通过时不调用 baidu-easy
+  - 专属页面凭证包含任务 ID 与过期时间（提交后 24 小时），以主密钥签名；篡改、伪造或过期的凭证不调用 baidu-easy；凭证不含访问密钥
+  - /t/{token}/* 不需要访问密钥，凭证即授权
+  - 下载链接有效期为专属页面剩余时间；剩余不足 60 秒按已过期处理
+  - 不提供列出全部任务、删除、重试与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link 与 /dl/{id}
+  - 调用 baidu-easy 时只携带主密钥，不转发用户请求的 Authorization；主密钥不出现在任何响应中
+  - 下载链接域名：协议优先取请求的 X-Forwarded-Proto，主机优先取 X-Forwarded-Host，否则取请求的协议与 Host；多值时取第一个
+  - 首页：填写访问密钥与分享文字提交，访问密钥不保存在浏览器，成功后跳转到专属页面；列出本浏览器提交过且未过期的专属页面
+  - 专属页面：显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间，不显示访问密钥；未结束时每 2 秒刷新；完成的单文件任务有「下载文件」「复制链接」，完成的多文件任务提示暂不支持；过期或无效时提示；始终有返回首页的按钮
+  - 接口错误显示 error.code 与 message，有 hint 时优先显示 hint
+depends:
+  - app/api
+errors:
+  - code: config_missing
+    desc: 未配置访问密钥或主密钥；进程以非零码退出
+  - code: unauthorized
+    desc: 缺少或错误的访问密钥；HTTP 401
+  - code: page_not_found
+    desc: 专属页面凭证无效或被篡改；HTTP 404
+  - code: page_expired
+    desc: 专属页面已过期；HTTP 410
+  - code: task_not_found
+    desc: 下载链接中的任务 ID 格式不合法；HTTP 404
+  - code: upstream_unavailable
+    desc: baidu-easy 无法连接、拒绝主密钥或返回非 JSON；HTTP 502
+tests:
+  - 用替身 baidu-easy 测试
+  - 鉴权：POST /tasks 无密钥、错误密钥、主密钥均返回 401 且未调用 baidu-easy；GET /、GET /t/{token}、/t/{token}/*、/dl 无需密钥
+  - 不提供列表：带密钥 GET /tasks、GET /tasks/{id} 不调用 baidu-easy
+  - 提交：转发到 baidu-easy 时带主密钥而不带用户密钥；成功响应带 page 与 page_expires_at，约 24 小时后过期；失败响应原样返回且不带 page
+  - 专属页面：凭证对应的任务与链接请求转发到正确的 baidu-easy 路径；篡改任务 ID、过期时间或签名返回 404；过期返回 410；均不调用 baidu-easy
+  - 下载链接：expires_in 为页面剩余时间；带 X-Forwarded-Proto/Host 时转发给 baidu-easy 的域名为该值
+  - /dl：查询参数与 Range 原样转发，206 与 Content-Range、Content-Disposition 原样返回；HEAD 无响应体；非法任务 ID 返回 404
+  - baidu-easy 无法连接、返回 401 时返回 502 upstream_unavailable
+  - 缺少任一密钥时进程拒绝启动
