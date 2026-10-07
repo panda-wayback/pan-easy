@@ -65,7 +65,8 @@
 
 <script>
 const HISTORY_STORE = "shop_history";
-const STATUS = { queued: "排队中", running: "下载中", done: "完成", failed: "失败", submitted: "转存已提交，尚未完成" };
+const STATUS = { queued: "排队中", running: "下载中", done: "完成", failed: "失败", submitted: "网盘转存中，完成后自动下载" };
+const ACTIVE = ["queued", "running", "submitted"];
 const $ = id => document.getElementById(id);
 
 async function api(method, path, body) {
@@ -148,7 +149,7 @@ function renderTask(t) {
     <div class="meta">提交于 ${esc(localTime(t.created_at))}，本页过期于 ${esc(new Date(pageExp).toLocaleString())}</div>`;
   const mine = history().find(h => h.page === location.pathname);
   if (mine && mine.remaining != null) html += `<div class="meta">本次提交后卡密剩余 ${esc(mine.remaining)} 次</div>`;
-  if (t.status === "queued" || t.status === "running") html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
+  if (ACTIVE.includes(t.status)) html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
   if (meta.length) html += `<div class="meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>`;
   if (t.status === "failed" && t.error) html += `<div class="msg err">失败原因：${esc(t.error.hint || t.error.message)}</div>`;
   if (single(t)) {
@@ -178,7 +179,7 @@ async function refreshTask() {
   try {
     const t = await api("GET", `/t/${token}/task`);
     renderTask(t);
-    if (t.status === "queued" || t.status === "running") timer = setTimeout(refreshTask, 2000);
+    if (ACTIVE.includes(t.status)) timer = setTimeout(refreshTask, 2000);
   } catch (e) {
     $("task-card").innerHTML = `<div class="msg err"></div>`;
     showErr($("task-card").querySelector(".msg"), e);

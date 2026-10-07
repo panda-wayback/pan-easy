@@ -11,10 +11,16 @@ input:
   - name: tasks_file
     type: path, optional
     desc: 任务历史文件；不提供时只保存在内存中
+  - name: transfer_timeout
+    type: seconds, optional
+    desc: 转存已提交后等待网盘出现转存结果的最长时间；默认 1800
+  - name: transfer_poll_interval
+    type: seconds, optional
+    desc: 等待转存结果时查询网盘的间隔；默认 10
 output:
   - name: task
     type: JSON {id, url, status, progress, speed?, downloaded?, total?, eta?, saved_to, pan_path?, result?, error?, created_at, finished_at?}
-    desc: status 取值 queued / running / done / failed / submitted；progress 为 0-100；speed 为字节/秒；downloaded、total 为字节；eta 为剩余秒数；saved_to 为服务器下载目录内的位置；pan_path 为网盘中的保存位置；result 为 bdpan 返回结果；error 为 {code, message, errno?, hint?}；未知的字段为 null
+    desc: status 取值 queued / running / submitted / done / failed，其中 queued、running、submitted 为未结束状态，submitted 表示网盘端转存仍在处理、完成后自动下载；progress 为 0-100；speed 为字节/秒；downloaded、total 为字节；eta 为剩余秒数；saved_to 为服务器下载目录内的位置；pan_path 为网盘中的保存位置；result 为 bdpan 返回结果；error 为 {code, message, errno?, hint?}；未知的字段为 null
 contract:
   - 链接取文字中第一个 pan.baidu.com/s/ 分享链接；提取码优先取链接中的 pwd 参数，否则取文字中的“提取码：xxxx”
   - 文字中没有分享链接时拒绝提交，不创建任务
@@ -23,11 +29,13 @@ contract:
   - speed、downloaded、total、eta 从 bdpan 进度行“(已下载/总大小, 速度) [已用:剩余]”实时解析，单位按 1000 进制；运行中为近似值
   - 完成时 total 与 downloaded 取 bdpan 结果中的文件大小合计，speed、eta 置 null；失败时 speed、eta 置 null
   - pan_path 取 bdpan 结果中的转存位置：单个文件为该文件的网盘路径，否则为转存目录；完成后才有值
-  - bdpan 返回“已提交”时任务状态为 submitted，保留 bdpan 返回的任务信息，不当作完成
+  - bdpan 返回“已提交”时任务状态为 submitted，result 为 bdpan 返回的任务信息；之后每隔 transfer_poll_interval 在转存目录（result 中的 target_dir 或 saved_path；单个文件时也在网盘 /apps/bdpan/ 下搜索）按名称与大小查找分享中的全部文件，全部找到后状态回到 running，从网盘下载到下载目录，完成后的字段与直接下载完成时一致
+  - submitted 期间仍占用执行位，后续任务继续排队
+  - transfer_timeout 内未找到全部转存结果时任务失败，error.code 为 transfer_timeout
   - 失败时保留 bdpan 的错误码与原因
   - 文件直接下载到下载目录；saved_to 为下载目录内的实际位置
   - 提供 tasks_file 时任务历史持久化：提交、开始、结束、删除、重试后整体写入（先写临时文件再替换）；运行中的进度与速度不写入；从文字中单独识别的提取码不写入（链接自带的 pwd 参数随链接保留）
-  - 启动时读取 tasks_file；其中 queued / running 的任务标记为 failed，error.code 为 interrupted，不自动重新执行
+  - 启动时读取 tasks_file；其中 queued / running / submitted 的任务标记为 failed，error.code 为 interrupted，不自动重新执行
   - 历史不限条数；支持删除单条任务记录，已下载的文件不删除
   - 支持重试 failed / interrupted 的任务：复制原分享链接与提取码，创建一个新任务 ID 并排队执行；原记录保留
 depends:
@@ -43,13 +51,19 @@ errors:
     desc: 任务失败原因：提取码错误、链接失效、空间不足等，携带 errno
   - code: interrupted
     desc: 任务失败原因：服务重启时任务尚未完成
+  - code: transfer_timeout
+    desc: 任务失败原因：转存已提交，但在 transfer_timeout 内未在网盘中找到全部转存结果
 tests:
   - 分享文字识别：链接带 pwd、文字中单独写提取码、两者都有、无提取码、无链接
   - 用替身 bdpan 验证多个任务按提交顺序逐个执行，不并发
   - 进度随输出更新且只增不减；完成为 100
   - 进度行解析出速度、已下载、总大小、剩余时间；输出分段到达时也能解析；完成后 total 为精确大小、speed 与 eta 为 null
   - 完成后 saved_to 与 pan_path 对应 bdpan 结果中的文件
-  - 失败保留错误码与原因；“已提交”结果对应 submitted 状态
+  - 失败保留错误码与原因
+  - “已提交”：先为 submitted；转存结果出现在 target_dir 后从网盘路径下载，最终 done 且 saved_to、pan_path、total 对应网盘下载结果；等待期间后续任务不执行
+  - “已提交”且没有目录信息：单个文件通过搜索按名称与大小找到后下载
+  - “已提交”后超时未找到：failed，error.code 为 transfer_timeout
+  - 重新加载后 submitted 任务为 interrupted
   - 历史持久化：完成的任务在新建队列后仍可查到；未完成的任务重新加载后为 interrupted；文件中不含提取码
   - 删除任务后按 ID 查询返回 404；删除运行中的任务时先取消该任务
   - 重试失败/中断任务返回新任务对象，新任务出现在列表最前面

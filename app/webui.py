@@ -30,9 +30,10 @@ _STATUS_LABEL = {
     "running": "下载中",
     "done": "完成",
     "failed": "失败",
-    "submitted": "转存已提交，尚未完成",
+    "submitted": "网盘转存中，完成后自动下载",
     "interrupted": "已中断",
 }
+_ACTIVE_STATUS = ("queued", "running", "submitted")
 _BYTE_UNITS = ["B", "kB", "MB", "GB", "TB"]
 
 
@@ -198,7 +199,7 @@ def create_webui(api_key: str, tasks: TaskQueue) -> FastAPI:
     @webui.get("/", response_class=HTMLResponse)
     async def page_download(request: Request):
         task_list = tasks.list()
-        has_active = any(t["status"] in ("queued", "running") for t in task_list)
+        has_active = any(t["status"] in _ACTIVE_STATUS for t in task_list)
         status, err = await _current_status() if request.state.valid_key else (None, None)
         view = _side_view(request.state.valid_key, status, err)
         return render(
@@ -259,7 +260,7 @@ def create_webui(api_key: str, tasks: TaskQueue) -> FastAPI:
         link_url = None
         if link_for:
             link_url = _cached_link(api_key, tasks, request, link_for)
-        has_active = any(t["status"] in ("queued", "running") for t in task_list)
+        has_active = any(t["status"] in _ACTIVE_STATUS for t in task_list)
         return render(
             request, "partials/_task_list.html",
             tasks=task_list, has_active=has_active,

@@ -26,10 +26,45 @@ _STATS_RE = re.compile(
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|m|s)")
 _UNITS = {"B": 1, "kB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4, "PB": 1000**5}
 _DURATION_UNITS = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+_AUTH_ERRORS = ("not_logged_in", "token_expired")
 
 
 class NoShareLink(ValueError):
     pass
+
+
+class _TransferTimeout(Exception):
+    pass
+
+
+def _pan_dir(path: Any) -> Optional[str]:
+    """bdpan 结果中的目录（显示路径、相对路径或绝对路径）转为网盘绝对路径。"""
+    if not isinstance(path, str) or not path.strip("/"):
+        return None
+    if path.startswith("我的应用数据/"):
+        return "/apps/" + path[len("我的应用数据/"):]
+    return path if path.startswith("/") else "/apps/bdpan/" + path
+
+
+def _entries(data: Any) -> list[dict[str, Any]]:
+    items = data if isinstance(data, list) else (data or {}).get("items") if isinstance(data, dict) else None
+    return [it for it in items or [] if isinstance(it, dict) and it.get("path")]
+
+
+def _match(items: list[dict[str, Any]], entries: list[dict[str, Any]]) -> Optional[list[str]]:
+    """分享中的每一项都按名称、类型与大小在网盘条目中找到时返回它们的网盘路径。"""
+    paths = []
+    for item in items:
+        for entry in entries:
+            is_dir = bool(entry.get("isdir") or entry.get("is_dir"))
+            if ((entry.get("server_filename") or entry.get("name")) == item.get("name")
+                    and is_dir == bool(item.get("is_dir"))
+                    and (is_dir or entry.get("size") == item.get("size"))):
+                paths.append(entry["path"])
+                break
+        else:
+            return None
+    return paths
 
 
 def parse_share(text: str) -> tuple[str, Optional[str]]:
@@ -66,10 +101,13 @@ def _now() -> str:
 
 
 class TaskQueue:
-    def __init__(self, bdpan, download_dir: str, tasks_file: Optional[str] = None, enable_smart_download: bool = None):
+    def __init__(self, bdpan, download_dir: str, tasks_file: Optional[str] = None, enable_smart_download: bool = None,
+                 transfer_timeout: float = 1800, transfer_poll_interval: float = 10):
         self.bdpan = bdpan
         self.download_dir = download_dir
         self.tasks_file = tasks_file
+        self.transfer_timeout = transfer_timeout
+        self.transfer_poll_interval = transfer_poll_interval
         # 默认启用智能下载，但可以通过参数或环境变量禁用
         if enable_smart_download is None:
             enable_smart_download = os.getenv("BAIDU_EASY_SMART_DOWNLOAD", "1") == "1"
@@ -87,7 +125,7 @@ class TaskQueue:
             tasks = json.load(f)
         interrupted = False
         for task in tasks:
-            if task.get("status") in ("queued", "running"):
+            if task.get("status") in ("queued", "running", "submitted"):
                 task.update(
                     status="failed",
                     speed=None,
@@ -416,6 +454,7 @@ class TaskQueue:
 
     async def _download_from_share(self, task: dict[str, Any]) -> None:
         """正常的转存 + 下载流程"""
+        items: list[dict[str, Any]] = []
         # 先获取文件信息以确定 size 目录
         try:
             flags = []
@@ -498,70 +537,76 @@ class TaskQueue:
         log.info("开始下载（转存后下载） task=%s target=%s", task["id"], target)
         try:
             data = await self.bdpan.run("download", [task["url"], target], flags, on_output=on_output)
+            if isinstance(data, dict) and data.get("status") == "submitted":
+                task["status"] = "submitted"
+                task["result"] = data
+                self._save()
+                log.info("转存已提交，等待网盘转存完成 task=%s", task["id"])
+                data = await self._download_transferred(task, data, items, target, on_output)
         except BdpanError as err:
             task["status"] = "failed"
             task["error"] = {"code": err.kind, "message": err.message, "errno": err.errno, "hint": err.hint}
             log.warning("任务失败 task=%s code=%s errno=%s message=%s",
                         task["id"], err.kind, err.errno, err.message)
+        except _TransferTimeout as err:
+            task["status"] = "failed"
+            task["error"] = {"code": "transfer_timeout", "message": str(err), "errno": None, "hint": None}
+            log.warning("任务失败 task=%s code=transfer_timeout", task["id"])
         except Exception as err:
             task["status"] = "failed"
             task["error"] = {"code": "internal", "message": f"{type(err).__name__}: {err}", "errno": None, "hint": None}
             log.error("任务异常 task=%s message=%s", task["id"], task["error"]["message"])
         else:
             task["result"] = data
-            if isinstance(data, dict) and data.get("status") == "submitted":
-                task["status"] = "submitted"
-                log.info("转存已提交，等待完成 task=%s", task["id"])
-            else:
-                task["status"] = "done"
-                task["progress"] = 100
-                self._fill_result(task, data if isinstance(data, dict) else {})
-                
-                # 如果需要打包，创建压缩包
-                if need_archive:
-                    try:
-                        import shutil
-                        import glob
+            task["status"] = "done"
+            task["progress"] = 100
+            self._fill_result(task, data if isinstance(data, dict) else {})
+            
+            # 如果需要打包，创建压缩包
+            if need_archive:
+                try:
+                    import shutil
+                    import glob
+                    
+                    # 获取下载的文件/文件夹
+                    downloaded_items = glob.glob(os.path.join(target_dir, "*"))
+                    
+                    if downloaded_items:
+                        # 确定压缩包名称
+                        if len(items) > 1:
+                            archive_name = f"multiple_files_{len(items)}"
+                        elif items[0].get("is_dir"):
+                            archive_name = items[0].get("name", "folder")
+                        else:
+                            archive_name = "archive"
                         
-                        # 获取下载的文件/文件夹
-                        downloaded_items = glob.glob(os.path.join(target_dir, "*"))
+                        # 创建 zip 压缩包
+                        archive_path = os.path.join(target_dir, f"{archive_name}.zip")
                         
-                        if downloaded_items:
-                            # 确定压缩包名称
-                            if len(items) > 1:
-                                archive_name = f"multiple_files_{len(items)}"
-                            elif items[0].get("is_dir"):
-                                archive_name = items[0].get("name", "folder")
-                            else:
-                                archive_name = "archive"
-                            
-                            # 创建 zip 压缩包
-                            archive_path = os.path.join(target_dir, f"{archive_name}.zip")
-                            
-                            log.info("开始打包 count=%s archive=%s task=%s",
-                                     len(downloaded_items), archive_path, task["id"])
-                            
-                            shutil.make_archive(
-                                os.path.join(target_dir, archive_name),
-                                'zip',
-                                target_dir
-                            )
-                            
-                            # 删除原始文件/文件夹
-                            for item_path in downloaded_items:
-                                if os.path.isfile(item_path):
-                                    os.remove(item_path)
-                                elif os.path.isdir(item_path):
-                                    shutil.rmtree(item_path)
-                            
-                            log.info("打包完成 archive=%s task=%s", archive_path, task["id"])
-                            
-                            # 更新任务信息
-                            task["saved_to"] = os.path.join(os.path.basename(target_dir), f"{archive_name}.zip")
-                            
-                    except Exception as e:
-                        log.warning("打包失败 task=%s err=%s", task["id"], e)
-                        # 打包失败不影响任务完成状态
+                        log.info("开始打包 count=%s archive=%s task=%s",
+                                 len(downloaded_items), archive_path, task["id"])
+                        
+                        shutil.make_archive(
+                            os.path.join(target_dir, archive_name),
+                            'zip',
+                            target_dir
+                        )
+                        
+                        # 删除原始文件/文件夹
+                        for item_path in downloaded_items:
+                            if os.path.isfile(item_path):
+                                os.remove(item_path)
+                            elif os.path.isdir(item_path):
+                                shutil.rmtree(item_path)
+                        
+                        log.info("打包完成 archive=%s task=%s", archive_path, task["id"])
+                        
+                        # 更新任务信息
+                        task["saved_to"] = os.path.join(os.path.basename(target_dir), f"{archive_name}.zip")
+                        
+                except Exception as e:
+                    log.warning("打包失败 task=%s err=%s", task["id"], e)
+                    # 打包失败不影响任务完成状态
         task["speed"] = None
         task["eta"] = None
         task["finished_at"] = _now()
@@ -569,6 +614,62 @@ class TaskQueue:
         if task["status"] == "done":
             log.info("任务完成（转存后下载） task=%s saved_to=%s total=%s",
                      task["id"], task.get("saved_to"), task.get("total"))
+
+    async def _download_transferred(self, task: dict[str, Any], submitted: dict[str, Any],
+                                    items: "list[dict[str, Any]]", target: str, on_output) -> Any:
+        """转存已提交：等网盘中出现分享的全部文件后，从网盘路径下载到 target。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.transfer_timeout
+        while True:
+            if not items:
+                items[:] = await self._share_items(task)
+            paths = await self._locate_transferred(submitted, items)
+            if paths:
+                break
+            if loop.time() >= deadline:
+                raise _TransferTimeout(f"转存已提交，但 {int(self.transfer_timeout)} 秒内未在网盘中找到转存结果，请稍后重试")
+            await asyncio.sleep(self.transfer_poll_interval)
+        task["status"] = "running"
+        self._save()
+        log.info("网盘转存已完成，开始下载 task=%s paths=%s", task["id"], paths)
+        results = [await self.bdpan.run("download", [path, target], [], on_output=on_output) for path in paths]
+        if len(results) == 1:
+            return results[0]
+        return {
+            "local": target,
+            "saved_path": submitted.get("target_dir") or submitted.get("saved_path"),
+            "items": [it for r in results if isinstance(r, dict) for it in r.get("items") or []],
+        }
+
+    async def _share_items(self, task: dict[str, Any]) -> "list[dict[str, Any]]":
+        flags = ["-p", task["pwd"]] if task.get("pwd") else []
+        data = await self._quiet(self.bdpan.run_subcommand("transfer", "list", [task["url"]], flags))
+        return [it for it in (data or {}).get("items") or [] if isinstance(it, dict)]
+
+    async def _locate_transferred(self, submitted: dict[str, Any],
+                                  items: "list[dict[str, Any]]") -> "Optional[list[str]]":
+        if not items:
+            return None
+        for key in ("target_dir", "saved_path"):
+            directory = _pan_dir(submitted.get(key))
+            if directory:
+                paths = _match(items, _entries(await self._quiet(self.bdpan.run("ls", [directory], []))))
+                if paths:
+                    return paths
+        if len(items) == 1 and not items[0].get("is_dir") and items[0].get("name"):
+            found = _entries(await self._quiet(self.bdpan.run("search", [items[0]["name"]], ["--no-dir"])))
+            return _match(items, [e for e in found if str(e["path"]).startswith("/apps/bdpan/")])
+        return None
+
+    async def _quiet(self, call) -> Any:
+        """查询失败视为暂未找到；未登录、Token 失效直接抛出。"""
+        try:
+            return await call
+        except BdpanError as err:
+            if err.kind in _AUTH_ERRORS:
+                raise
+            log.info("查询转存结果失败 code=%s message=%s", err.kind, err.message)
+            return None
 
     def _fill_result(self, task: dict[str, Any], data: dict[str, Any]) -> None:
         items = [it for it in data.get("items") or [] if isinstance(it, dict)]
