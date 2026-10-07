@@ -30,6 +30,14 @@ def test_serves_web_page_without_key(fake_bin, tmp_path):
     assert "baidu-easy" in res.text
 
 
+def test_serves_public_page(fake_bin, tmp_path):
+    client = TestClient(create_app(KEY, fake_bin, download_dir=str(tmp_path / "dl")))
+    res = client.get("/public")
+    assert res.status_code == 200
+    assert "text/html" in res.headers["content-type"]
+    assert "网盘文件下载" in res.text
+
+
 def test_combined_flow(fake_bin, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_BDPAN_STORE", str(tmp_path / "drive"))
     work = tmp_path / "work"

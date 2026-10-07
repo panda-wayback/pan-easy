@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import create_api, create_dl
@@ -13,6 +14,7 @@ from app.tasks import TaskQueue
 from app.webui import create_webui
 
 WEB_STATIC = Path(__file__).resolve().parent.parent / "web" / "static"
+PUBLIC_PAGE = Path(__file__).resolve().parent.parent / "web-public" / "index.html"
 
 
 def create_app(
@@ -30,6 +32,7 @@ def create_app(
     app.mount("/api", create_api(bdpan, api_key, tasks, tmp_dir))
     app.mount("/dl", create_dl(api_key, tasks))
     app.mount("/static", StaticFiles(directory=str(WEB_STATIC)), name="static")
+    app.add_api_route("/public", lambda: FileResponse(PUBLIC_PAGE), methods=["GET"])
     # webui 最后挂载：其页面路由作为未匹配路径的页面层兜底
     app.mount("/", create_webui(api_key, tasks))
     return app
