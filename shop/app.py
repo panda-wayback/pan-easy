@@ -19,6 +19,13 @@ PAGE = Path(__file__).resolve().parent / "index.html"
 PAGE_TTL = 86400
 _LINK_MIN = 60
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_SHARE_RE = re.compile(r"pan\.baidu\.com/s/", re.IGNORECASE)
+_CARD_ERRORS = {
+    "CODE_USED": ("card_used", "卡密次数已用完"),
+    "CODE_TYPE_MISMATCH": ("card_type_mismatch", "该卡密不是按次数卡密，不能用于本服务"),
+    "BATCH_DISABLED": ("card_disabled", "卡密已停用"),
+    "PRODUCT_DISABLED": ("card_disabled", "卡密已停用"),
+}
 _DL_HEADERS = ("content-type", "content-length", "content-range", "accept-ranges",
                "content-disposition", "etag", "last-modified")
 
@@ -57,28 +64,39 @@ def _public_origin(request: Request) -> tuple[str, str]:
 
 
 def create_app(
-    access_key: str,
     api_key: str,
     upstream_url: str,
+    auth_url: str,
     transport: Optional[httpx.AsyncBaseTransport] = None,
+    auth_transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> FastAPI:
     client = httpx.AsyncClient(base_url=upstream_url, transport=transport, timeout=60.0)
+    auth = httpx.AsyncClient(base_url=auth_url, transport=auth_transport, timeout=15.0)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
         await client.aclose()
+        await auth.aclose()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
-    expected = f"Bearer {access_key}".encode()
 
-    @app.middleware("http")
-    async def check_access_key(request: Request, call_next):
-        if request.url.path.startswith("/tasks"):
-            supplied = request.headers.get("authorization", "").encode()
-            if not hmac.compare_digest(supplied, expected):
-                return _error("unauthorized", "缺少或错误的访问密钥", 401)
-        return await call_next(request)
+    async def redeem(code: str) -> tuple[Optional[int], Optional[JSONResponse]]:
+        """核销按次数卡密 1 次，返回剩余次数。"""
+        try:
+            resp = await auth.post("/api/redeem", json={"code": code})
+            data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            return None, _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
+        if data.get("ok") is True and isinstance(data.get("remaining"), int):
+            return data["remaining"], None
+        error = data.get("error")
+        if data.get("ok") is not False or not isinstance(error, dict):
+            return None, _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
+        code_name, message = _CARD_ERRORS.get(error.get("code"), ("card_invalid", "卡密无效"))
+        return None, _error(code_name, message, 403)
 
     async def forward(method: str, path: str, body: bytes = b"",
                       extra_headers: Optional[dict[str, str]] = None) -> JSONResponse:
@@ -117,7 +135,21 @@ def create_app(
 
     @app.post("/tasks")
     async def submit_task(request: Request):
-        resp = await forward("POST", "/api/tasks", await request.body())
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            return _error("invalid_argument", "请求格式错误", 400)
+        text, code = payload.get("text"), payload.get("code")
+        if not isinstance(text, str) or not _SHARE_RE.search(text):
+            return _error("invalid_argument", "文字中没有找到百度网盘分享链接", 400)
+        if not isinstance(code, str) or not code.strip():
+            return _error("invalid_argument", "请输入卡密", 400)
+        remaining, err = await redeem(code)
+        if err:
+            return err
+        resp = await forward("POST", "/api/tasks", json.dumps({"text": text}).encode())
         if resp.status_code != 202:
             return resp
         body = json.loads(resp.body)
@@ -128,6 +160,7 @@ def create_app(
         exp = int(time.time()) + PAGE_TTL
         data["page"] = f"/t/{task_id}.{exp}.{_page_sig(api_key, task_id, exp)}"
         data["page_expires_at"] = _iso(exp)
+        data["remaining"] = remaining
         return JSONResponse(body, status_code=202)
 
     @app.get("/t/{token}/task")
@@ -173,17 +206,17 @@ def _parse_addr(addr: str) -> tuple[str, int]:
 
 
 def main() -> None:
-    access_key = os.environ.get("SHOP_ACCESS_KEY", "")
     api_key = os.environ.get("BAIDU_EASY_API_KEY", "")
-    if not access_key or not api_key:
-        print("shop: 未配置 SHOP_ACCESS_KEY 或 BAIDU_EASY_API_KEY，拒绝启动", file=sys.stderr)
+    auth_url = os.environ.get("SPARK_AUTH_URL", "")
+    if not api_key or not auth_url:
+        print("shop: 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL，拒绝启动", file=sys.stderr)
         sys.exit(1)
     host, port = _parse_addr(os.environ.get("SHOP_ADDR", ":8080"))
     upstream = os.environ.get("BAIDU_EASY_URL", "http://baidu-easy:8080")
 
     import uvicorn
 
-    uvicorn.run(create_app(access_key, api_key, upstream), host=host, port=port)
+    uvicorn.run(create_app(api_key, upstream, auth_url), host=host, port=port)
 
 
 if __name__ == "__main__":

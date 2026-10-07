@@ -20,9 +20,11 @@ services:
     ports:
       - "28081:8080"
     environment:
-      SHOP_ACCESS_KEY: ${SHOP_ACCESS_KEY:?请先设置 SHOP_ACCESS_KEY}
       BAIDU_EASY_API_KEY: ${BAIDU_EASY_API_KEY:?请先设置 BAIDU_EASY_API_KEY}
       BAIDU_EASY_URL: http://baidu-easy:8080
+      SPARK_AUTH_URL: ${SPARK_AUTH_URL:-http://host.docker.internal:8000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   baidu-easy-data:

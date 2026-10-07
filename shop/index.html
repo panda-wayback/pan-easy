@@ -39,8 +39,9 @@
 
   <div id="home" class="hidden">
     <div class="card">
-      <strong>访问密钥</strong>
-      <div class="row"><input id="key" type="password" placeholder="输入访问密钥"></div>
+      <strong>卡密</strong>
+      <div class="meta">每次提交扣 1 次</div>
+      <div class="row"><input id="code" type="password" placeholder="输入卡密"></div>
     </div>
 
     <div class="card">
@@ -67,9 +68,8 @@ const HISTORY_STORE = "shop_history";
 const STATUS = { queued: "排队中", running: "下载中", done: "完成", failed: "失败", submitted: "转存已提交，尚未完成" };
 const $ = id => document.getElementById(id);
 
-async function api(method, path, body, key) {
+async function api(method, path, body) {
   const headers = {};
-  if (key) headers.Authorization = "Bearer " + key;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   let json = null;
@@ -115,12 +115,12 @@ function initHome() {
   $("home").classList.remove("hidden");
   localStorage.removeItem("shop_access_key"); // 清除旧版本保存过的密钥
   $("submit").onclick = async () => {
-    const key = $("key").value.trim();
-    if (!key) { show($("submit-msg"), "warn", "请先输入访问密钥"); return; }
+    const code = $("code").value.trim();
+    if (!code) { show($("submit-msg"), "warn", "请先输入卡密"); return; }
     try {
-      const t = await api("POST", "/tasks", { text: $("share").value }, key);
+      const t = await api("POST", "/tasks", { text: $("share").value, code });
       const list = history();
-      list.unshift({ page: t.page, url: t.url, created_at: t.created_at, expires_at: t.page_expires_at });
+      list.unshift({ page: t.page, url: t.url, created_at: t.created_at, expires_at: t.page_expires_at, remaining: t.remaining });
       localStorage.setItem(HISTORY_STORE, JSON.stringify(list));
       location.href = t.page;
     } catch (e) { showErr($("submit-msg"), e); }
@@ -146,6 +146,8 @@ function renderTask(t) {
   let html = `<div class="top"><span class="title">${esc(title)}</span><span class="tag">${esc(status)}</span></div>
     <div class="meta">分享链接：${esc(t.url)}</div>
     <div class="meta">提交于 ${esc(localTime(t.created_at))}，本页过期于 ${esc(new Date(pageExp).toLocaleString())}</div>`;
+  const mine = history().find(h => h.page === location.pathname);
+  if (mine && mine.remaining != null) html += `<div class="meta">本次提交后卡密剩余 ${esc(mine.remaining)} 次</div>`;
   if (t.status === "queued" || t.status === "running") html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
   if (meta.length) html += `<div class="meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>`;
   if (t.status === "failed" && t.error) html += `<div class="msg err">失败原因：${esc(t.error.hint || t.error.message)}</div>`;

@@ -112,13 +112,14 @@ def test_shop_flow(fake_bin, tmp_path, monkeypatch):
     (tmp_path / "drive.login").touch()
     downloads = tmp_path / "downloads"
     easy = create_app(KEY, fake_bin, download_dir=str(downloads))
-    shop = create_shop("shop-key", KEY, "http://baidu-easy", transport=httpx.ASGITransport(app=easy))
-    auth = {"Authorization": "Bearer shop-key"}
+    spark = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "ok": True, "remaining": 2, "redeemed_at": "2026-10-07T23:00:00+08:00"}))
+    shop = create_shop(KEY, "http://baidu-easy", "http://spark-auth",
+                       transport=httpx.ASGITransport(app=easy), auth_transport=spark)
 
     with TestClient(shop, base_url="http://shop.example") as client:
-        assert client.get("/tasks", headers=AUTH).status_code == 401
-        res = client.post("/tasks", json={"text": "链接：https://pan.baidu.com/s/1abc?pwd=PhPR"}, headers=auth)
-        assert res.status_code == 202
+        res = client.post("/tasks", json={"text": "链接：https://pan.baidu.com/s/1abc?pwd=PhPR", "code": "CARD"})
+        assert res.status_code == 202 and res.json()["data"]["remaining"] == 2
         task_id, page = res.json()["data"]["id"], res.json()["data"]["page"]
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:

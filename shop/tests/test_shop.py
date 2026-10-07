@@ -15,21 +15,18 @@ from fastapi.testclient import TestClient
 from shop.app import create_app
 
 ROOT = Path(__file__).resolve().parents[2]
-ACCESS = "shop-key"
 MASTER = "master-key"
-AUTH = {"Authorization": f"Bearer {ACCESS}"}
-SUBMIT = {"text": "https://pan.baidu.com/s/1abc"}
+CARD = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"
+SHARE = "https://pan.baidu.com/s/1abc"
+SUBMIT = {"text": SHARE, "code": CARD}
 
 
-class Upstream:
-    """替身 baidu-easy：记录收到的请求，按 (方法, 路径) 返回预设响应。"""
+class Fake:
+    """替身服务：记录收到的请求，按 (方法, 路径) 返回预设响应。"""
 
-    def __init__(self):
+    def __init__(self, responses):
         self.calls = []
-        self.responses = {
-            ("POST", "/api/tasks"): lambda: JSONResponse(
-                {"ok": True, "data": {"id": "abc123", "url": SUBMIT["text"], "status": "queued"}}, status_code=202),
-        }
+        self.responses = responses
         self.app = FastAPI()
 
         @self.app.api_route("/{path:path}", methods=["GET", "POST", "HEAD"])
@@ -47,62 +44,131 @@ class Upstream:
 
 @pytest.fixture
 def upstream():
-    return Upstream()
+    return Fake({
+        ("POST", "/api/tasks"): lambda: JSONResponse(
+            {"ok": True, "data": {"id": "abc123", "url": SHARE, "status": "queued"}}, status_code=202),
+    })
 
 
 @pytest.fixture
-def client(upstream):
-    app = create_app(ACCESS, MASTER, "http://baidu-easy", transport=httpx.ASGITransport(app=upstream.app))
+def spark():
+    return Fake({
+        ("POST", "/api/redeem"): lambda: JSONResponse(
+            {"ok": True, "remaining": 4, "redeemed_at": "2026-10-07T23:00:00+08:00"}),
+    })
+
+
+@pytest.fixture
+def client(upstream, spark):
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                     transport=httpx.ASGITransport(app=upstream.app),
+                     auth_transport=httpx.ASGITransport(app=spark.app))
     with TestClient(app) as c:
         yield c
 
 
 def submit(client):
-    res = client.post("/tasks", json=SUBMIT, headers=AUTH)
+    res = client.post("/tasks", json=SUBMIT)
     assert res.status_code == 202
     return res.json()["data"]
 
 
-def test_pages_without_key(client, upstream):
+def spark_error(code, status=403):
+    return lambda: JSONResponse({"ok": False, "error": {"code": code, "message": "x"}}, status_code=status)
+
+
+def test_pages_without_card(client, upstream, spark):
     for path in ("/", "/t/anything"):
         res = client.get(path)
         assert res.status_code == 200 and "text/html" in res.headers["content-type"]
         assert "网盘文件下载" in res.text
-    assert upstream.calls == []
+    assert upstream.calls == [] and spark.calls == []
 
 
-@pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": f"Bearer {MASTER}"}])
-def test_submit_rejects_missing_or_wrong_key(client, upstream, headers):
-    res = client.post("/tasks", json=SUBMIT, headers=headers)
-    assert res.status_code == 401 and res.json()["error"]["code"] == "unauthorized"
+@pytest.mark.parametrize("body", [
+    {"text": "没有链接", "code": CARD},
+    {"text": "https://pan.example.com/s/1abc", "code": CARD},
+    {"text": SHARE, "code": "  "},
+    {"text": SHARE},
+    ["not", "object"],
+])
+def test_submit_checks_before_redeem(client, upstream, spark, body):
+    res = client.post("/tasks", json=body)
+    assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_argument"
+    assert upstream.calls == [] and spark.calls == []
+
+
+def test_submit_rejects_non_json(client, upstream, spark):
+    res = client.post("/tasks", content=b"not json", headers={"Content-Type": "application/json"})
+    assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_argument"
+    assert upstream.calls == [] and spark.calls == []
+
+
+@pytest.mark.parametrize("spark_code, status, code", [
+    ("CODE_INVALID", 403, "card_invalid"),
+    ("REQUEST_INVALID", 400, "card_invalid"),
+    ("SOMETHING_NEW", 403, "card_invalid"),
+    ("CODE_USED", 403, "card_used"),
+    ("CODE_TYPE_MISMATCH", 403, "card_type_mismatch"),
+    ("BATCH_DISABLED", 403, "card_disabled"),
+    ("PRODUCT_DISABLED", 403, "card_disabled"),
+])
+def test_redeem_failure_maps_error(client, upstream, spark, spark_code, status, code):
+    spark.responses[("POST", "/api/redeem")] = spark_error(spark_code, status)
+    res = client.post("/tasks", json=SUBMIT)
+    assert res.status_code == 403 and res.json()["error"]["code"] == code
+    assert CARD not in res.text
+    assert len(spark.calls) == 1 and upstream.calls == []
+
+
+def test_redeem_unavailable(upstream):
+    def refuse(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    def not_json(request):
+        return httpx.Response(200, content=b"<html>")
+
+    for transport in (httpx.MockTransport(refuse), httpx.MockTransport(not_json)):
+        app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                         transport=httpx.ASGITransport(app=upstream.app), auth_transport=transport)
+        with TestClient(app) as client:
+            res = client.post("/tasks", json=SUBMIT)
+            assert res.status_code == 502 and res.json()["error"]["code"] == "auth_unavailable"
     assert upstream.calls == []
 
 
 def test_no_task_listing(client, upstream):
-    assert client.get("/tasks", headers=AUTH).status_code == 405
-    assert client.get("/tasks/abc123", headers=AUTH).status_code == 404
+    assert client.get("/tasks").status_code == 405
+    assert client.get("/tasks/abc123").status_code == 404
     assert upstream.calls == []
 
 
-def test_submit_creates_page(client, upstream):
+def test_submit_redeems_then_creates_page(client, upstream, spark):
     data = submit(client)
+    assert len(spark.calls) == 1
+    redeem = spark.calls[0]
+    assert (redeem["method"], redeem["path"]) == ("POST", "/api/redeem")
+    assert json.loads(redeem["body"]) == {"code": CARD}
+    assert "authorization" not in redeem["headers"]
+
     call = upstream.calls[-1]
     assert (call["method"], call["path"]) == ("POST", "/api/tasks")
-    assert json.loads(call["body"]) == SUBMIT
+    assert json.loads(call["body"]) == {"text": SHARE}
     assert call["headers"]["authorization"] == f"Bearer {MASTER}"
-    assert ACCESS not in str(call["headers"])
 
     assert data["id"] == "abc123" and data["page"].startswith("/t/abc123.")
-    assert ACCESS not in data["page"] and MASTER not in data["page"]
+    assert data["remaining"] == 4
+    assert CARD not in json.dumps(data) and MASTER not in data["page"]
     remaining = datetime.fromisoformat(data["page_expires_at"]).timestamp() - time.time()
     assert 86400 - 10 < remaining <= 86400
 
 
-def test_submit_error_passes_through(client, upstream):
+def test_submit_error_passes_through(client, upstream, spark):
     error = {"ok": False, "error": {"code": "invalid_argument", "message": "文字中没有找到百度网盘分享链接"}}
     upstream.responses[("POST", "/api/tasks")] = lambda: JSONResponse(error, status_code=400)
-    res = client.post("/tasks", json={"text": "x"}, headers=AUTH)
+    res = client.post("/tasks", json=SUBMIT)
     assert res.status_code == 400 and res.json() == error
+    assert len(spark.calls) == 1
 
 
 def test_page_task_and_link(client, upstream):
@@ -172,26 +238,27 @@ def test_dl_forwards_range(client, upstream):
     assert res.status_code == 404 and res.json()["error"]["code"] == "task_not_found"
 
 
-def test_upstream_unreachable():
+def test_upstream_unreachable(spark):
     def refuse(request):
         raise httpx.ConnectError("refused", request=request)
 
-    app = create_app(ACCESS, MASTER, "http://baidu-easy", transport=httpx.MockTransport(refuse))
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth", transport=httpx.MockTransport(refuse),
+                     auth_transport=httpx.ASGITransport(app=spark.app))
     with TestClient(app) as client:
-        for res in (client.post("/tasks", json=SUBMIT, headers=AUTH), client.get("/dl/abc?exp=1&sig=x")):
+        for res in (client.post("/tasks", json=SUBMIT), client.get("/dl/abc?exp=1&sig=x")):
             assert res.status_code == 502 and res.json()["error"]["code"] == "upstream_unavailable"
 
 
 def test_upstream_rejects_master_key(client, upstream):
     error = {"ok": False, "error": {"code": "unauthorized", "message": "缺少或错误的访问密钥"}}
     upstream.responses[("POST", "/api/tasks")] = lambda: JSONResponse(error, status_code=401)
-    res = client.post("/tasks", json=SUBMIT, headers=AUTH)
+    res = client.post("/tasks", json=SUBMIT)
     assert res.status_code == 502 and res.json()["error"]["code"] == "upstream_unavailable"
 
 
-@pytest.mark.parametrize("missing", ["SHOP_ACCESS_KEY", "BAIDU_EASY_API_KEY"])
-def test_refuses_to_start_without_keys(missing):
-    env = {**os.environ, "SHOP_ACCESS_KEY": ACCESS, "BAIDU_EASY_API_KEY": MASTER}
+@pytest.mark.parametrize("missing", ["BAIDU_EASY_API_KEY", "SPARK_AUTH_URL"])
+def test_refuses_to_start_without_config(missing):
+    env = {**os.environ, "BAIDU_EASY_API_KEY": MASTER, "SPARK_AUTH_URL": "http://spark-auth"}
     env.pop(missing)
     proc = subprocess.run([sys.executable, "-m", "shop.app"], cwd=ROOT, env=env,
                           capture_output=True, text=True, timeout=30)
