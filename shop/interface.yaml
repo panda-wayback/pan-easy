@@ -14,6 +14,9 @@ input:
   - name: SHOP_ADDR
     type: env string
     desc: 监听地址；默认 :8081
+  - name: SHOP_RETRIES_FILE
+    type: env string
+    desc: 专属页面重试记录文件；默认 shop-retries.json，镜像内为 /data/shop-retries.json
   - name: GET /
     type: 无参数
     desc: 首页
@@ -29,6 +32,9 @@ input:
   - name: POST /t/{token}/link
     type: path token
     desc: 为专属页面对应的完成单文件任务生成下载链接
+  - name: POST /t/{token}/retry
+    type: path token
+    desc: 重试专属页面对应的失败或中断任务，不需要卡密、不扣次数
   - name: GET|HEAD /dl/{id}
     type: path id；query exp, sig；header Range?
     desc: 用下载链接下载任务文件
@@ -41,7 +47,10 @@ output:
     desc: 成功时为 baidu-easy POST /api/tasks 的响应，data 额外带 page（专属页面路径 /t/{token}）、page_expires_at（ISO 8601）与 remaining（卡密剩余次数）；baidu-easy 失败时与其状态码与响应体一致
   - name: GET /t/{token}/task
     type: JSON
-    desc: 与 baidu-easy GET /api/tasks/{id} 的状态码与响应体一致（任务格式见 app/tasks/interface.yaml）
+    desc: 与 baidu-easy GET /api/tasks/{id} 的状态码与响应体一致（任务格式见 app/tasks/interface.yaml）；成功时 data 额外带 retries_left（本页面剩余重试次数）
+  - name: POST /t/{token}/retry
+    type: JSON
+    desc: 成功时为 baidu-easy POST /api/tasks/{id}/retry 的响应（202，新任务对象），data 额外带 retries_left；baidu-easy 拒绝时与其状态码与响应体一致
   - name: POST /t/{token}/link
     type: JSON
     desc: 与 baidu-easy POST /api/tasks/{id}/link 的状态码与响应体一致；url 指向本服务域名
@@ -58,12 +67,18 @@ contract:
   - 卡密不转发给 baidu-easy，不出现在任何响应与专属页面网址中
   - 专属页面凭证包含任务 ID 与过期时间（提交后 24 小时），以主密钥签名；篡改、伪造或过期的凭证不调用 baidu-easy
   - /t/{token}/* 与 /dl 不需要卡密，凭证即授权
+  - 专属页面始终对应「当前任务」：首次提交的任务，重试成功后为最新创建的任务；/t/{token}/task、/link、/retry 都作用于当前任务；网址不变
+  - 重试不调用 spark-auth、不扣次数；每个专属页面最多重试 3 次，用完后返回 retry_exhausted 且不调用 baidu-easy；只有 baidu-easy 接受重试（202）才计入次数
+  - 重试记录（页面对应的当前任务与已重试次数）写入 SHOP_RETRIES_FILE（先写临时文件再替换），重启后仍在；同一页面的新旧网址共享记录；页面过期的记录在写入时删除
+  - 重试不延长页面过期时间
   - 下载链接有效期为专属页面剩余时间；剩余不足 60 秒按已过期处理
-  - 不提供列出全部任务、删除、重试与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link 与 /dl/{id}
+  - 不提供列出全部任务、删除与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link、POST /api/tasks/{id}/retry 与 /dl/{id}
   - 调用 baidu-easy 时只携带主密钥，不转发用户请求的 Authorization；主密钥不出现在任何响应中
   - 下载链接域名：协议优先取请求的 X-Forwarded-Proto，主机优先取 X-Forwarded-Host，否则取请求的协议与 Host；多值时取第一个
-  - 首页：填写卡密与分享文字提交，卡密不保存在浏览器，成功后跳转到专属页面；列出本浏览器提交过且未过期的专属页面，历史记录带提交后的剩余次数
-  - 专属页面：显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间，本浏览器历史中有该页面时显示卡密剩余次数，不显示卡密；未结束时每 2 秒刷新；完成的单文件任务有「下载文件」「复制链接」，完成的多文件任务提示暂不支持；过期或无效时提示；始终有返回首页的按钮
+  - 首页：填写卡密与分享文字提交，成功后跳转到专属页面
+  - 首页卡密：提交成功后保存到本浏览器本地存储，下次打开首页自动填入，输入框为密码形式；提交返回 card_invalid / card_used / card_type_mismatch / card_disabled 时删除已保存的卡密；「清除」按钮清空输入框并删除已保存的卡密；输入框下提示卡密保存在本浏览器；卡密不写入历史记录与专属页面
+  - 首页历史：列出本浏览器提交过且未过期的专属页面，历史记录带提交后的剩余次数
+  - 专属页面：显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间，本浏览器历史中有该页面时显示卡密剩余次数，不显示卡密；未结束时每 2 秒刷新；完成的单文件任务有「下载文件」「复制链接」，完成的多文件任务提示暂不支持；失败或中断时有剩余次数时显示「重试（剩余 N 次）」，用完时提示重试次数已用完；过期或无效时提示；始终有返回首页的按钮
   - 接口错误显示 error.code 与 message，有 hint 时优先显示 hint
 depends:
   - app/api
@@ -88,6 +103,8 @@ errors:
     desc: 专属页面已过期；HTTP 410
   - code: task_not_found
     desc: 下载链接中的任务 ID 格式不合法；HTTP 404
+  - code: retry_exhausted
+    desc: 本页面重试次数已用完；HTTP 409
   - code: upstream_unavailable
     desc: baidu-easy 无法连接、拒绝主密钥或返回非 JSON；HTTP 502
 tests:
@@ -96,9 +113,11 @@ tests:
   - 核销失败：spark-auth 各错误码映射为对应 code 与 403，不调用 baidu-easy；spark-auth 无法连接或返回非 JSON 时返回 502 auth_unavailable
   - 提交：先核销再转发；核销请求只带 code；转发到 baidu-easy 时只带 {text} 与主密钥；成功响应带 page、page_expires_at（约 24 小时后）与 remaining；baidu-easy 失败响应原样返回且不带 page
   - 不提供列表：GET /tasks、GET /tasks/{id} 不调用 baidu-easy
-  - 网页：GET /、GET /t/{token} 无需卡密
+  - 网页：GET /、GET /t/{token} 无需卡密；首页含卡密「清除」按钮与保存在本浏览器的提示
   - 专属页面：凭证对应的任务与链接请求转发到正确的 baidu-easy 路径；篡改任务 ID、过期时间或签名返回 404；过期返回 410；均不调用 baidu-easy
   - 下载链接：expires_in 为页面剩余时间；带 X-Forwarded-Proto/Host 时转发给 baidu-easy 的域名为该值
   - /dl：查询参数与 Range 原样转发，206 与 Content-Range、Content-Disposition 原样返回；HEAD 无响应体；非法任务 ID 返回 404
   - baidu-easy 无法连接、返回 401 时返回 502 upstream_unavailable
   - 缺少主密钥或卡密服务地址时进程拒绝启动
+  - 重试：不调用 spark-auth；转发到当前任务的 retry 路径；成功后 /task 与 /link 指向新任务且 retries_left 减 1；第 4 次返回 409 retry_exhausted 且不调用 baidu-easy；baidu-easy 拒绝（409）时原样返回且不计次数
+  - 重试记录持久化：重建 shop 后同一网址仍指向重试后的任务、剩余次数不变；篡改或过期的凭证重试返回 404/410 且不调用 baidu-easy

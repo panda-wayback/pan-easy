@@ -82,6 +82,7 @@ def test_pages_without_card(client, upstream, spark):
         res = client.get(path)
         assert res.status_code == 200 and "text/html" in res.headers["content-type"]
         assert "网盘文件下载" in res.text
+        assert 'id="clear-code"' in res.text and "卡密保存在本浏览器" in res.text
     assert upstream.calls == [] and spark.calls == []
 
 
@@ -201,7 +202,7 @@ def test_tampered_page_rejected(client, upstream):
     calls = len(upstream.calls)
     for bad in (f"other.{exp}.{sig}", f"{task_id}.{int(exp) + 1}.{sig}", f"{task_id}.{exp}.{'0' * 32}",
                 f"{task_id}.{exp}", "a.b.c", "x"):
-        for res in (client.get(f"/t/{bad}/task"), client.post(f"/t/{bad}/link")):
+        for res in (client.get(f"/t/{bad}/task"), client.post(f"/t/{bad}/link"), client.post(f"/t/{bad}/retry")):
             assert res.status_code == 404 and res.json()["error"]["code"] == "page_not_found", bad
     assert len(upstream.calls) == calls
 
@@ -211,9 +212,74 @@ def test_expired_page(client, upstream, monkeypatch):
     calls = len(upstream.calls)
     now = time.time()
     monkeypatch.setattr(time, "time", lambda: now + 86400)
-    for res in (client.get(f"{page}/task"), client.post(f"{page}/link")):
+    for res in (client.get(f"{page}/task"), client.post(f"{page}/link"), client.post(f"{page}/retry")):
         assert res.status_code == 410 and res.json()["error"]["code"] == "page_expired"
     assert len(upstream.calls) == calls
+
+
+def retry_ok(new_id):
+    return lambda: JSONResponse({"ok": True, "data": {"id": new_id, "url": SHARE, "status": "queued"}},
+                                status_code=202)
+
+
+def test_retry_switches_page_to_new_task_without_redeem(client, upstream, spark):
+    page = submit(client)["page"]
+    upstream.responses[("POST", "/api/tasks/abc123/retry")] = retry_ok("new1")
+
+    res = client.post(f"{page}/retry")
+    assert res.status_code == 202
+    assert res.json()["data"]["id"] == "new1" and res.json()["data"]["retries_left"] == 2
+    assert len(spark.calls) == 1
+    call = upstream.calls[-1]
+    assert (call["method"], call["path"]) == ("POST", "/api/tasks/abc123/retry")
+    assert call["headers"]["authorization"] == f"Bearer {MASTER}"
+
+    res = client.get(f"{page}/task")
+    assert upstream.calls[-1]["path"] == "/api/tasks/new1"
+    assert res.json()["data"]["retries_left"] == 2
+    client.post(f"{page}/link")
+    assert upstream.calls[-1]["path"] == "/api/tasks/new1/link"
+
+
+def test_retry_limit(client, upstream, spark):
+    page = submit(client)["page"]
+    assert client.get(f"{page}/task").json()["data"]["retries_left"] == 3
+    for old, new in (("abc123", "r1"), ("r1", "r2"), ("r2", "r3")):
+        upstream.responses[("POST", f"/api/tasks/{old}/retry")] = retry_ok(new)
+        assert client.post(f"{page}/retry").status_code == 202
+    calls = len(upstream.calls)
+    res = client.post(f"{page}/retry")
+    assert res.status_code == 409 and res.json()["error"]["code"] == "retry_exhausted"
+    assert len(upstream.calls) == calls and len(spark.calls) == 1
+    assert client.get(f"{page}/task").json()["data"]["retries_left"] == 0
+
+
+def test_retry_rejected_by_upstream_not_counted(client, upstream):
+    page = submit(client)["page"]
+    error = {"ok": False, "error": {"code": "task_not_ready", "message": "任务状态不可重试"}}
+    upstream.responses[("POST", "/api/tasks/abc123/retry")] = lambda: JSONResponse(error, status_code=409)
+    res = client.post(f"{page}/retry")
+    assert res.status_code == 409 and res.json() == error
+    client.get(f"{page}/task")
+    assert upstream.calls[-1]["path"] == "/api/tasks/abc123"
+
+
+def test_retry_persists_across_restart(upstream, spark, tmp_path):
+    retries_file = str(tmp_path / "data" / "shop-retries.json")
+
+    def make():
+        return create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                          transport=httpx.ASGITransport(app=upstream.app),
+                          auth_transport=httpx.ASGITransport(app=spark.app), retries_file=retries_file)
+
+    upstream.responses[("POST", "/api/tasks/abc123/retry")] = retry_ok("new1")
+    with TestClient(make()) as client:
+        page = submit(client)["page"]
+        assert client.post(f"{page}/retry").status_code == 202
+    with TestClient(make()) as client:
+        res = client.get(f"{page}/task")
+        assert upstream.calls[-1]["path"] == "/api/tasks/new1"
+        assert res.json()["data"]["retries_left"] == 2
 
 
 def test_dl_forwards_range(client, upstream):

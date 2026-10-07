@@ -44,6 +44,7 @@ ENV BDPAN_CONFIG_DIR=/data/bdpan \
     BAIDU_EASY_DOWNLOAD_DIR=/downloads \
     BAIDU_EASY_TASKS_FILE=/data/tasks.json \
     SHOP_ADDR=:8081 \
+    SHOP_RETRIES_FILE=/data/shop-retries.json \
     BAIDU_EASY_URL=http://127.0.0.1:8080 \
     PYTHONUNBUFFERED=1
 

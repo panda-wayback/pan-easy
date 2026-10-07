@@ -41,7 +41,12 @@
     <div class="card">
       <strong>卡密</strong>
       <div class="meta">每次提交扣 1 次</div>
-      <div class="row"><input id="code" type="password" placeholder="输入卡密"></div>
+      <div class="row">
+        <input id="code" type="password" placeholder="输入卡密" autocomplete="off">
+        <button class="ghost" id="clear-code">清除</button>
+      </div>
+      <div class="meta">卡密保存在本浏览器，公共电脑用完请清除</div>
+      <div class="msg" id="code-msg"></div>
     </div>
 
     <div class="card">
@@ -65,6 +70,8 @@
 
 <script>
 const HISTORY_STORE = "shop_history";
+const CARD_STORE = "shop_card";
+const CARD_REJECTED = ["card_invalid", "card_used", "card_type_mismatch", "card_disabled"];
 const STATUS = { queued: "排队中", running: "下载中", done: "完成", failed: "失败", submitted: "网盘转存中，完成后自动下载" };
 const ACTIVE = ["queued", "running", "submitted"];
 const $ = id => document.getElementById(id);
@@ -115,16 +122,26 @@ function renderHistory() {
 function initHome() {
   $("home").classList.remove("hidden");
   localStorage.removeItem("shop_access_key"); // 清除旧版本保存过的密钥
+  $("code").value = localStorage.getItem(CARD_STORE) || "";
+  $("clear-code").onclick = () => {
+    localStorage.removeItem(CARD_STORE);
+    $("code").value = "";
+    show($("code-msg"), "ok", "已清除本浏览器保存的卡密");
+  };
   $("submit").onclick = async () => {
     const code = $("code").value.trim();
     if (!code) { show($("submit-msg"), "warn", "请先输入卡密"); return; }
     try {
       const t = await api("POST", "/tasks", { text: $("share").value, code });
+      localStorage.setItem(CARD_STORE, code);
       const list = history();
       list.unshift({ page: t.page, url: t.url, created_at: t.created_at, expires_at: t.page_expires_at, remaining: t.remaining });
       localStorage.setItem(HISTORY_STORE, JSON.stringify(list));
       location.href = t.page;
-    } catch (e) { showErr($("submit-msg"), e); }
+    } catch (e) {
+      if (CARD_REJECTED.includes(e.code)) localStorage.removeItem(CARD_STORE);
+      showErr($("submit-msg"), e);
+    }
   };
   renderHistory();
 }
@@ -152,6 +169,11 @@ function renderTask(t) {
   if (ACTIVE.includes(t.status)) html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
   if (meta.length) html += `<div class="meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>`;
   if (t.status === "failed" && t.error) html += `<div class="msg err">失败原因：${esc(t.error.hint || t.error.message)}</div>`;
+  if (t.status === "failed") {
+    html += t.retries_left > 0
+      ? `<div class="row"><button id="retry">重试（剩余 ${esc(t.retries_left)} 次）</button><span class="meta">不扣卡密次数</span></div>`
+      : `<div class="msg warn">本页面重试次数已用完，请返回首页重新提交</div>`;
+  }
   if (single(t)) {
     html += `<div class="row"><button id="dl">下载文件</button><button class="ghost" id="copy">复制链接</button></div>`;
   } else if (t.status === "done") {
@@ -159,6 +181,7 @@ function renderTask(t) {
   }
   html += `<div class="msg" id="task-msg"></div>`;
   $("task-card").innerHTML = html;
+  if ($("retry")) $("retry").onclick = retry;
   if (single(t)) {
     $("dl").onclick = () => link(url => { location.href = url; });
     $("copy").onclick = () => link(async (url, expires_at) => {
@@ -173,6 +196,18 @@ async function link(use) {
     const { url, expires_at } = await api("POST", `/t/${token}/link`);
     await use(url, expires_at);
   } catch (e) { showErr($("task-msg"), e.code ? e : { code: "copy_failed", message: "复制失败，请检查浏览器权限" }); }
+}
+
+async function retry() {
+  $("retry").disabled = true;
+  try {
+    await api("POST", `/t/${token}/retry`);
+    clearTimeout(timer);
+    await refreshTask();
+  } catch (e) {
+    $("retry").disabled = false;
+    showErr($("task-msg"), e);
+  }
 }
 
 async function refreshTask() {

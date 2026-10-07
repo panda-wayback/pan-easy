@@ -1,6 +1,7 @@
 .env
 downloads/
 tasks.json
+shop-retries.json
 .venv/
 __pycache__/
 .pytest_cache/

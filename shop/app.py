@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import hmac
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -17,6 +19,7 @@ from starlette.background import BackgroundTask
 
 PAGE = Path(__file__).resolve().parent / "index.html"
 PAGE_TTL = 86400
+RETRY_LIMIT = 3
 _LINK_MIN = 60
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SHARE_RE = re.compile(r"pan\.baidu\.com/s/", re.IGNORECASE)
@@ -52,6 +55,29 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def _load_retries(path: Optional[str]) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def _save_retries(path: Optional[str], records: dict) -> None:
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".shop-retries-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(records, f)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
 def _public_origin(request: Request) -> tuple[str, str]:
     def first(name: str) -> str:
         return request.headers.get(name, "").split(",")[0].strip()
@@ -69,9 +95,13 @@ def create_app(
     auth_url: str,
     transport: Optional[httpx.AsyncBaseTransport] = None,
     auth_transport: Optional[httpx.AsyncBaseTransport] = None,
+    retries_file: Optional[str] = None,
 ) -> FastAPI:
     client = httpx.AsyncClient(base_url=upstream_url, transport=transport, timeout=60.0)
     auth = httpx.AsyncClient(base_url=auth_url, transport=auth_transport, timeout=15.0)
+    # 专属页面（以首次提交的任务 ID 标识）→ {task: 当前任务 ID, count: 已重试次数, exp: 页面过期时间}
+    retries: dict = _load_retries(retries_file)
+    retry_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -125,6 +155,21 @@ def create_app(
             return None, 0, _error("page_expired", "页面已过期，请重新提交", 410)
         return task_id, exp, None
 
+    def current_task(page_id: str) -> str:
+        return retries.get(page_id, {}).get("task", page_id)
+
+    def retries_left(page_id: str) -> int:
+        return RETRY_LIMIT - retries.get(page_id, {}).get("count", 0)
+
+    def with_retries_left(resp: JSONResponse, page_id: str) -> JSONResponse:
+        if resp.status_code >= 300:
+            return resp
+        body = json.loads(resp.body)
+        if not isinstance(body.get("data"), dict):
+            return resp
+        body["data"]["retries_left"] = retries_left(page_id)
+        return JSONResponse(body, status_code=resp.status_code)
+
     @app.get("/")
     async def home():
         return FileResponse(PAGE, media_type="text/html")
@@ -165,20 +210,45 @@ def create_app(
 
     @app.get("/t/{token}/task")
     async def page_task(token: str):
-        task_id, _, err = open_page(token)
+        page_id, _, err = open_page(token)
         if err:
             return err
-        return await forward("GET", f"/api/tasks/{task_id}")
+        return with_retries_left(await forward("GET", f"/api/tasks/{current_task(page_id)}"), page_id)
 
     @app.post("/t/{token}/link")
     async def page_link(token: str, request: Request):
-        task_id, exp, err = open_page(token)
+        page_id, exp, err = open_page(token)
         if err:
             return err
         proto, host = _public_origin(request)
         body = json.dumps({"expires_in": exp - int(time.time())}).encode()
-        return await forward("POST", f"/api/tasks/{task_id}/link", body,
+        return await forward("POST", f"/api/tasks/{current_task(page_id)}/link", body,
                              {"X-Forwarded-Proto": proto, "X-Forwarded-Host": host})
+
+    @app.post("/t/{token}/retry")
+    async def page_retry(token: str):
+        page_id, exp, err = open_page(token)
+        if err:
+            return err
+        async with retry_lock:
+            if retries_left(page_id) <= 0:
+                return _error("retry_exhausted", "本页面重试次数已用完，请重新提交", 409)
+            resp = await forward("POST", f"/api/tasks/{current_task(page_id)}/retry")
+            if resp.status_code != 202:
+                return resp
+            body = json.loads(resp.body)
+            data = body.get("data")
+            new_id = data.get("id") if isinstance(data, dict) else None
+            if not isinstance(new_id, str) or not _TASK_ID_RE.match(new_id):
+                return _unavailable()
+            count = RETRY_LIMIT - retries_left(page_id) + 1
+            now = time.time()
+            for key in [k for k, r in retries.items() if r.get("exp", 0) < now]:
+                del retries[key]
+            retries[page_id] = {"task": new_id, "count": count, "exp": exp}
+            _save_retries(retries_file, retries)
+            data["retries_left"] = retries_left(page_id)
+            return JSONResponse(body, status_code=202)
 
     @app.api_route("/dl/{task_id}", methods=["GET", "HEAD"])
     async def download(task_id: str, request: Request):
@@ -216,7 +286,8 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(create_app(api_key, upstream, auth_url), host=host, port=port)
+    retries_file = os.environ.get("SHOP_RETRIES_FILE", "shop-retries.json")
+    uvicorn.run(create_app(api_key, upstream, auth_url, retries_file=retries_file), host=host, port=port)
 
 
 if __name__ == "__main__":

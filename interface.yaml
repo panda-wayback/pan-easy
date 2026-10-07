@@ -46,7 +46,7 @@ output:
 contract:
   - 未配置 BAIDU_EASY_API_KEY 时拒绝启动并输出原因
   - 镜像内 bdpan 版本固定，构建时校验 SHA256，校验失败则构建失败
-  - 镜像内不包含任何 bdpan 凭据；/data 为持久卷，bdpan 配置只写入 /data/bdpan，任务历史写入 /data/tasks.json
+  - 镜像内不包含任何 bdpan 凭据；/data 为持久卷，bdpan 配置只写入 /data/bdpan，任务历史写入 /data/tasks.json，shop 重试记录写入 /data/shop-retries.json
   - /downloads 为下载目录卷；compose 将宿主机 ./downloads 挂载到 /downloads
   - 容器内同时运行 API 服务（8080）与 shop（8081），shop 经 127.0.0.1:8080 调用 API 服务；任一进程退出时另一进程被停止、容器退出
   - 容器未配置 SPARK_AUTH_URL 时 shop 拒绝启动并输出原因，容器随之退出
