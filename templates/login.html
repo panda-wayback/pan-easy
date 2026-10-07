@@ -37,7 +37,7 @@
     </ol>
     <label><input type="checkbox" id="accept" form="login-url-form" name="accept_disclaimer" value="on"> 我已阅读并认可上述条款</label>
   </div>
-  <form hx-post="/session/login/url" hx-target="#login-url-box" hx-swap="outerHTML">
+  <form id="login-url-form" hx-post="/session/login/url" hx-target="#login-url-box" hx-swap="outerHTML">
     <div class="row">
       <button type="submit">获取授权链接</button>
       <span id="login-url-box"></span>

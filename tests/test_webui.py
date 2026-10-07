@@ -180,6 +180,15 @@ def test_login_url_requires_accept(client):
     assert "安全须知" in res.text
 
 
+def test_login_page_accept_checkbox_submits_with_url_form(client):
+    import re
+
+    html = client.get("/login").text
+    checkbox = re.search(r'<input[^>]*name="accept_disclaimer"[^>]*>', html).group(0)
+    owner = re.search(r'form="([^"]+)"', checkbox).group(1)
+    assert re.search(rf'<form[^>]*id="{owner}"[^>]*hx-post="/session/login/url"', html)
+
+
 def test_login_url_success(client):
     res = client.post(
         "/session/login/url", data={"accept_disclaimer": "on"}, headers=AUTH

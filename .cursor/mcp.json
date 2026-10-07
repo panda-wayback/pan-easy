@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "spark-auth": {
-      "url": "http://107.174.218.129:12347/mcp"
+      "url": "http://127.0.0.1:8000/mcp"
     }
   }
 }
