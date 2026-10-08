@@ -376,6 +376,13 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
         except NoShareLink as err:
             raise _invalid(str(err)) from None
 
+    @api.post("/tasks/preview")
+    async def preview_task(body: TaskBody):
+        try:
+            return _ok(await tasks.preview(body.text))
+        except NoShareLink as err:
+            raise _invalid(str(err)) from None
+
     @api.get("/tasks")
     async def list_tasks():
         return _ok(tasks.list())

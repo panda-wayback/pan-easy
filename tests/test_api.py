@@ -33,6 +33,13 @@ class StubBdpan:
             raise self.errors[command]
         return self.results.get(command, {"status": "ok"})
 
+    async def run_subcommand(self, command, subcommand, positionals=(), flags=()):
+        name = f"{command} {subcommand}"
+        self.calls.append((name, list(positionals), list(flags), None))
+        if name in self.errors:
+            raise self.errors[name]
+        return self.results.get(name, {"items": []})
+
 
 @pytest.fixture
 def stub():
@@ -262,6 +269,38 @@ def test_tasks_without_link_rejected(client, stub):
     res = client.post("/tasks", json={"text": "没有链接的文字"}, headers=AUTH)
     assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_argument"
     assert stub.calls == []
+
+
+def test_tasks_preview(client, stub):
+    stub.results["transfer list"] = {
+        "items": [
+            {"name": "a.bin", "size": 150_000_000, "is_dir": False},
+            {"name": "dir", "size": 0, "is_dir": True},
+        ]
+    }
+    res = client.post("/tasks/preview", json={"text": "https://pan.baidu.com/s/1abc?pwd=wxyz"}, headers=AUTH)
+    assert res.status_code == 200
+    assert res.json() == {"ok": True, "data": {"total_bytes": 150_000_000}}
+    assert stub.calls == [
+        ("transfer list", ["https://pan.baidu.com/s/1abc?pwd=wxyz"], ["-p", "wxyz"], None),
+    ]
+    assert client.get("/tasks", headers=AUTH).json()["data"] == []
+
+
+def test_tasks_preview_without_link(client, stub):
+    res = client.post("/tasks/preview", json={"text": "没有链接"}, headers=AUTH)
+    assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_argument"
+    assert stub.calls == []
+
+
+def test_tasks_preview_bdpan_error(client, stub):
+    stub.errors["transfer list"] = BdpanError("bdpan_error", "提取码错误", -9)
+    res = client.post("/tasks/preview", json={"text": "https://pan.baidu.com/s/1abc?pwd=bad"}, headers=AUTH)
+    assert res.status_code == 502
+    assert res.json()["error"]["code"] == "bdpan_error"
+    assert stub.calls == [
+        ("transfer list", ["https://pan.baidu.com/s/1abc?pwd=bad"], ["-p", "bad"], None),
+    ]
 
 
 def test_unknown_task_404(client):

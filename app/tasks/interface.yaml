@@ -4,7 +4,10 @@ modules: []
 input:
   - name: text
     type: string
-    desc: 用户粘贴的百度网盘分享文字
+    desc: 用户粘贴的百度网盘分享文字；用于提交任务
+  - name: preview
+    type: string
+    desc: 用户粘贴的百度网盘分享文字；只读查询分享信息，不创建任务、不转存、不下载
   - name: download_dir
     type: path
     desc: 服务器上的下载目录
@@ -24,14 +27,19 @@ output:
   - name: task
     type: JSON {id, url, status, progress, speed?, downloaded?, total?, eta?, saved_to, pan_path?, result?, error?, created_at, finished_at?, alias_of?}
     desc: status 取值 queued / running / submitted / done / failed，其中 queued、running、submitted 为未结束状态，submitted 表示网盘端转存仍在处理、完成后自动下载；progress 为 0-100；speed 为字节/秒；downloaded、total 为字节；eta 为剩余秒数；saved_to 为服务器下载目录内的位置；pan_path 为网盘中的保存位置；result 为 bdpan 返回结果；error 为 {code, message, errno?, hint?}；alias_of 非空时本任务与该 ID 的任务内容完全重叠、不重复执行，其 status/progress/speed/downloaded/total/eta/saved_to/pan_path/result/error/finished_at 均与该任务一致，仅 id、url、created_at 为自身值；未知的字段为 null
+  - name: preview
+    type: JSON {total_bytes}
+    desc: total_bytes 为分享中全部文件大小合计（字节，1000 进制）；不含目录自身大小
 contract:
   - 链接取文字中第一个 pan.baidu.com/s/ 分享链接；提取码优先取链接中的 pwd 参数，否则取文字中的“提取码：xxxx”
-  - 文字中没有分享链接时拒绝提交，不创建任务
+  - 文字中没有分享链接时拒绝提交与预览，不创建任务
+  - 预览只调用 transfer list（只读），不创建任务、不写入 tasks_file、不占用转存与下载名额；链接失效、提取码错误等以 bdpan 错误原样返回
   - 任务按提交顺序开始；开始后先查询分享信息（transfer list，只读，不占用转存与下载名额），随后按以下顺序短路，前一步命中则不再执行后续步骤
   - 第一步 本地缓存：分享为单个文件且下载目录中已有同名且同大小的文件时直接标记完成，不再查询网盘、转存与下载
   - 第二步 云盘去重：在自己网盘 /apps/bdpan/ 下按同名同大小找到文件时免转存，直接从该网盘路径下载；否则需要转存，转存阶段全局串行（同一百度账号同时只允许一个转存）
   - 转存时 bdpan 返回“已提交”则任务为 submitted，持转存锁按 transfer_poll_interval 轮询等待，不占用下载并发名额；transfer_timeout 内未出现全部转存结果时失败
-  - 第三步 任务合并：免转存或转存完成后、真正发起下载之前，与其它未失败任务做最后一次重叠判定：规范化后分享链接相同，或分享条目逐个同名、同类型、同大小即完全重叠（部分重叠不合并）；命中时标记 alias_of 为被重叠任务 ID，立即结束，不再下载
+  - 转存失败且 errno 为 13045（自己分享的链接）：在整个网盘按同名同大小查找分享中的全部文件（含目录条目则不查找、仍按原错误失败）；全部找到则直接从网盘路径下载；任一找不到则仍以原 13045 错误失败
+  - 第三步 任务合并：免转存、自己分享直下或转存完成后、真正发起下载之前，与其它未失败任务做最后一次重叠判定：规范化后分享链接相同，或分享条目逐个同名、同类型、同大小即完全重叠（部分重叠不合并）；命中时标记 alias_of 为被重叠任务 ID，立即结束，不再下载
   - 未命中合并时进入下载阶段：最多 max_downloads 个任务同时下载到本地；max_downloads 为 1 时逐个执行
   - 被重叠任务结束前，重叠任务的进度等字段始终与其一致；被重叠任务失败时重叠任务同样失败；重试重叠任务时新建任务并自行执行
   - 重叠任务生成下载链接时指向被重叠任务的同一文件（链接中的任务 ID 为被重叠任务 ID）
@@ -64,9 +72,11 @@ errors:
     desc: 任务失败原因：转存已提交，但在 transfer_timeout 内未在网盘中找到全部转存结果
 tests:
   - 分享文字识别：链接带 pwd、文字中单独写提取码、两者都有、无提取码、无链接
+  - 预览：无链接拒绝且不调用 bdpan；有链接时只调用 transfer list，返回全部文件大小合计，不创建任务、不写 tasks_file；链接失效等错误原样返回且不创建任务
   - 用替身 bdpan 验证：转存阶段严格串行，转存完成后的下载阶段最多 max_downloads 个任务同时进行；max_downloads 为 1 时逐个执行
   - 本地缓存：下载目录已有同名同大小文件时直接完成，不调用网盘查询、转存与下载，且优先于其余两级
   - 云盘去重：网盘 /apps/bdpan/ 下已有同名同大小文件时免转存、直接下载；未找到时才转存
+  - 自己分享（errno 13045）：全盘按同名同大小找到后直接下载且不转存；找不到或含目录条目时仍失败并保留 13045
   - 重叠合并：链接相同或条目逐个同名同大小时后一任务在下载前标记 alias_of、不产生下载，其状态、进度与结果实时跟随被重叠任务，完成后链接指向同一文件；部分重叠不合并；被重叠任务失败时重叠任务同样失败
   - 进度随输出更新且只增不减；完成为 100
   - 进度行解析出速度、已下载、总大小、剩余时间；输出分段到达时也能解析；完成后 total 为精确大小、speed 与 eta 为 null

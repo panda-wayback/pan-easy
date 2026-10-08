@@ -12,13 +12,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.testclient import TestClient
 
-from shop.app import create_app
+from shop.app import cost_uses, create_app
 
 ROOT = Path(__file__).resolve().parents[2]
 MASTER = "master-key"
 CARD = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"
 SHARE = "https://pan.baidu.com/s/1abc"
 SUBMIT = {"text": SHARE, "code": CARD}
+PREVIEW_BYTES = 50_000_000  # → cost 1
 
 
 class Fake:
@@ -45,6 +46,8 @@ class Fake:
 @pytest.fixture
 def upstream():
     return Fake({
+        ("POST", "/api/tasks/preview"): lambda: JSONResponse(
+            {"ok": True, "data": {"total_bytes": PREVIEW_BYTES}}),
         ("POST", "/api/tasks"): lambda: JSONResponse(
             {"ok": True, "data": {"id": "abc123", "url": SHARE, "status": "queued"}}, status_code=202),
     })
@@ -53,8 +56,10 @@ def upstream():
 @pytest.fixture
 def spark():
     return Fake({
+        ("POST", "/api/redeem/status"): lambda: JSONResponse(
+            {"ok": True, "uses": 10, "used": 0, "remaining": 10}),
         ("POST", "/api/redeem"): lambda: JSONResponse(
-            {"ok": True, "remaining": 4, "redeemed_at": "2026-10-07T23:00:00+08:00"}),
+            {"ok": True, "remaining": 9, "redeemed_at": "2026-10-07T23:00:00+08:00"}),
     })
 
 
@@ -105,6 +110,19 @@ def test_submit_rejects_non_json(client, upstream, spark):
     assert upstream.calls == [] and spark.calls == []
 
 
+@pytest.mark.parametrize("total, expected", [
+    (0, 1),
+    (1, 1),
+    (50_000_000, 1),
+    (100_000_000, 1),
+    (100_000_001, 2),
+    (150_000_000, 2),
+    (1_000_000_000, 10),
+])
+def test_cost_uses(total, expected):
+    assert cost_uses(total) == expected
+
+
 @pytest.mark.parametrize("spark_code, status, code", [
     ("CODE_INVALID", 403, "card_invalid"),
     ("REQUEST_INVALID", 400, "card_invalid"),
@@ -119,7 +137,8 @@ def test_redeem_failure_maps_error(client, upstream, spark, spark_code, status, 
     res = client.post("/tasks", json=SUBMIT)
     assert res.status_code == 403 and res.json()["error"]["code"] == code
     assert CARD not in res.text
-    assert len(spark.calls) == 1 and upstream.calls == []
+    assert [c["path"] for c in spark.calls] == ["/api/redeem/status", "/api/redeem"]
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
 
 
 def test_redeem_unavailable(upstream):
@@ -135,7 +154,8 @@ def test_redeem_unavailable(upstream):
         with TestClient(app) as client:
             res = client.post("/tasks", json=SUBMIT)
             assert res.status_code == 502 and res.json()["error"]["code"] == "auth_unavailable"
-    assert upstream.calls == []
+            assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
+            upstream.calls.clear()
 
 
 def test_no_task_listing(client, upstream):
@@ -144,24 +164,57 @@ def test_no_task_listing(client, upstream):
     assert upstream.calls == []
 
 
+def test_preview_failure_skips_auth(client, upstream, spark):
+    error = {"ok": False, "error": {"code": "bdpan_error", "message": "提取码错误", "errno": -9}}
+    upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(error, status_code=502)
+    res = client.post("/tasks", json=SUBMIT)
+    assert res.status_code == 502 and res.json() == error
+    assert spark.calls == []
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
+
+
+def test_insufficient_remaining_skips_redeem(client, upstream, spark):
+    spark.responses[("POST", "/api/redeem/status")] = lambda: JSONResponse(
+        {"ok": True, "uses": 10, "used": 10, "remaining": 0})
+    res = client.post("/tasks", json=SUBMIT)
+    assert res.status_code == 403 and res.json()["error"]["code"] == "card_used"
+    assert [c["path"] for c in spark.calls] == ["/api/redeem/status"]
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
+
+
 def test_submit_redeems_then_creates_page(client, upstream, spark):
     data = submit(client)
-    assert len(spark.calls) == 1
-    redeem = spark.calls[0]
-    assert (redeem["method"], redeem["path"]) == ("POST", "/api/redeem")
-    assert json.loads(redeem["body"]) == {"code": CARD}
-    assert "authorization" not in redeem["headers"]
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview", "/api/tasks"]
+    assert json.loads(upstream.calls[0]["body"]) == {"text": SHARE}
+    assert json.loads(upstream.calls[1]["body"]) == {"text": SHARE}
+    assert upstream.calls[1]["headers"]["authorization"] == f"Bearer {MASTER}"
 
-    call = upstream.calls[-1]
-    assert (call["method"], call["path"]) == ("POST", "/api/tasks")
-    assert json.loads(call["body"]) == {"text": SHARE}
-    assert call["headers"]["authorization"] == f"Bearer {MASTER}"
+    assert [c["path"] for c in spark.calls] == ["/api/redeem/status", "/api/redeem"]
+    assert json.loads(spark.calls[0]["body"]) == {"code": CARD}
+    assert json.loads(spark.calls[1]["body"]) == {"code": CARD, "count": 1}
+    assert "authorization" not in spark.calls[0]["headers"]
 
     assert data["id"] == "abc123" and data["page"].startswith("/t/abc123.")
-    assert data["remaining"] == 4
+    assert data["cost"] == 1 and data["remaining"] == 9
     assert CARD not in json.dumps(data) and MASTER not in data["page"]
     remaining = datetime.fromisoformat(data["page_expires_at"]).timestamp() - time.time()
     assert 86400 - 10 < remaining <= 86400
+
+
+@pytest.mark.parametrize("total_bytes, cost", [
+    (50_000_000, 1),
+    (100_000_000, 1),
+    (150_000_000, 2),
+    (1_000_000_000, 10),
+])
+def test_submit_cost_by_size(client, upstream, spark, total_bytes, cost):
+    upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(
+        {"ok": True, "data": {"total_bytes": total_bytes}})
+    spark.responses[("POST", "/api/redeem")] = lambda: JSONResponse(
+        {"ok": True, "remaining": 100 - cost, "redeemed_at": "2026-10-07T23:00:00+08:00"})
+    data = submit(client)
+    assert data["cost"] == cost and data["remaining"] == 100 - cost
+    assert json.loads(spark.calls[-1]["body"]) == {"code": CARD, "count": cost}
 
 
 def test_submit_error_passes_through(client, upstream, spark):
@@ -169,7 +222,7 @@ def test_submit_error_passes_through(client, upstream, spark):
     upstream.responses[("POST", "/api/tasks")] = lambda: JSONResponse(error, status_code=400)
     res = client.post("/tasks", json=SUBMIT)
     assert res.status_code == 400 and res.json() == error
-    assert len(spark.calls) == 1
+    assert len(spark.calls) == 2
 
 
 def test_page_task_and_link(client, upstream):
@@ -224,12 +277,13 @@ def retry_ok(new_id):
 
 def test_retry_switches_page_to_new_task_without_redeem(client, upstream, spark):
     page = submit(client)["page"]
+    spark_calls = len(spark.calls)
     upstream.responses[("POST", "/api/tasks/abc123/retry")] = retry_ok("new1")
 
     res = client.post(f"{page}/retry")
     assert res.status_code == 202
     assert res.json()["data"]["id"] == "new1" and res.json()["data"]["retries_left"] == 2
-    assert len(spark.calls) == 1
+    assert len(spark.calls) == spark_calls
     call = upstream.calls[-1]
     assert (call["method"], call["path"]) == ("POST", "/api/tasks/abc123/retry")
     assert call["headers"]["authorization"] == f"Bearer {MASTER}"
@@ -243,6 +297,7 @@ def test_retry_switches_page_to_new_task_without_redeem(client, upstream, spark)
 
 def test_retry_limit(client, upstream, spark):
     page = submit(client)["page"]
+    spark_calls = len(spark.calls)
     assert client.get(f"{page}/task").json()["data"]["retries_left"] == 3
     for old, new in (("abc123", "r1"), ("r1", "r2"), ("r2", "r3")):
         upstream.responses[("POST", f"/api/tasks/{old}/retry")] = retry_ok(new)
@@ -250,7 +305,7 @@ def test_retry_limit(client, upstream, spark):
     calls = len(upstream.calls)
     res = client.post(f"{page}/retry")
     assert res.status_code == 409 and res.json()["error"]["code"] == "retry_exhausted"
-    assert len(upstream.calls) == calls and len(spark.calls) == 1
+    assert len(upstream.calls) == calls and len(spark.calls) == spark_calls
     assert client.get(f"{page}/task").json()["data"]["retries_left"] == 0
 
 

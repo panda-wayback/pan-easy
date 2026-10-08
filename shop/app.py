@@ -21,6 +21,7 @@ PAGE = Path(__file__).resolve().parent / "index.html"
 PAGE_TTL = 86400
 RETRY_LIMIT = 3
 _LINK_MIN = 60
+BYTES_PER_USE = 100_000_000  # 100MB（1000 进制）= 1 次
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SHARE_RE = re.compile(r"pan\.baidu\.com/s/", re.IGNORECASE)
 _CARD_ERRORS = {
@@ -29,6 +30,13 @@ _CARD_ERRORS = {
     "BATCH_DISABLED": ("card_disabled", "卡密已停用"),
     "PRODUCT_DISABLED": ("card_disabled", "卡密已停用"),
 }
+
+
+def cost_uses(total_bytes: int) -> int:
+    """按文件总大小计算扣费次数：每 100MB 1 次，至少 1。"""
+    if total_bytes <= 0:
+        return 1
+    return max(1, (total_bytes + BYTES_PER_USE - 1) // BYTES_PER_USE)
 _DL_HEADERS = ("content-type", "content-length", "content-range", "accept-ranges",
                "content-disposition", "etag", "last-modified")
 
@@ -111,17 +119,17 @@ def create_app(
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
-    async def redeem(code: str) -> tuple[Optional[int], Optional[JSONResponse]]:
-        """核销按次数卡密 1 次，返回剩余次数。"""
+    async def auth_json(path: str, payload: dict) -> tuple[Optional[dict], Optional[JSONResponse]]:
+        """调用 spark-auth JSON 接口；成功返回响应体，失败返回错误响应。"""
         try:
-            resp = await auth.post("/api/redeem", json={"code": code})
+            resp = await auth.post(path, json=payload)
             data = resp.json()
         except (httpx.HTTPError, ValueError):
             data = None
         if not isinstance(data, dict):
             return None, _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
-        if data.get("ok") is True and isinstance(data.get("remaining"), int):
-            return data["remaining"], None
+        if data.get("ok") is True:
+            return data, None
         error = data.get("error")
         if data.get("ok") is not False or not isinstance(error, dict):
             return None, _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
@@ -191,9 +199,31 @@ def create_app(
             return _error("invalid_argument", "文字中没有找到百度网盘分享链接", 400)
         if not isinstance(code, str) or not code.strip():
             return _error("invalid_argument", "请输入卡密", 400)
-        remaining, err = await redeem(code)
+
+        preview = await forward("POST", "/api/tasks/preview", json.dumps({"text": text}).encode())
+        if preview.status_code != 200:
+            return preview
+        preview_body = json.loads(preview.body)
+        preview_data = preview_body.get("data") if isinstance(preview_body, dict) else None
+        total_bytes = preview_data.get("total_bytes") if isinstance(preview_data, dict) else None
+        if not isinstance(total_bytes, int) or total_bytes < 0:
+            return _unavailable()
+        uses = cost_uses(total_bytes)
+
+        status_data, err = await auth_json("/api/redeem/status", {"code": code})
         if err:
             return err
+        remaining_now = status_data.get("remaining") if status_data else None
+        if not isinstance(remaining_now, int) or remaining_now < uses:
+            return _error("card_used", "卡密次数不足，请充值后重新提交", 403)
+
+        redeem_data, err = await auth_json("/api/redeem", {"code": code, "count": uses})
+        if err:
+            return err
+        remaining = redeem_data.get("remaining") if redeem_data else None
+        if not isinstance(remaining, int):
+            return _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
+
         resp = await forward("POST", "/api/tasks", json.dumps({"text": text}).encode())
         if resp.status_code != 202:
             return resp
@@ -205,6 +235,7 @@ def create_app(
         exp = int(time.time()) + PAGE_TTL
         data["page"] = f"/t/{task_id}.{exp}.{_page_sig(api_key, task_id, exp)}"
         data["page_expires_at"] = _iso(exp)
+        data["cost"] = uses
         data["remaining"] = remaining
         return JSONResponse(body, status_code=202)
 

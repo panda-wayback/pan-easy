@@ -40,7 +40,7 @@
   <div id="home" class="hidden">
     <div class="card">
       <strong>卡密</strong>
-      <div class="meta">每次提交扣 1 次</div>
+      <div class="meta">按文件大小计费：每 100MB 扣 1 次，不足 100MB 按 1 次</div>
       <div class="row">
         <input id="code" type="password" placeholder="输入卡密" autocomplete="off">
         <button class="ghost" id="clear-code">清除</button>
@@ -115,7 +115,12 @@ function history() {
 function renderHistory() {
   const list = history();
   $("history").innerHTML = list.length
-    ? list.map(h => `<a href="${esc(h.page)}">${esc(h.url)}<div class="meta">提交于 ${esc(localTime(h.created_at))}，过期于 ${esc(localTime(h.expires_at))}</div></a>`).join("")
+    ? list.map(h => {
+        const bits = [`提交于 ${localTime(h.created_at)}`, `过期于 ${localTime(h.expires_at)}`];
+        if (h.cost != null) bits.push(`扣 ${h.cost} 次`);
+        if (h.remaining != null) bits.push(`剩余 ${h.remaining} 次`);
+        return `<a href="${esc(h.page)}">${esc(h.url)}<div class="meta">${esc(bits.join("，"))}</div></a>`;
+      }).join("")
     : `<div class="empty">还没有提交过</div>`;
 }
 
@@ -135,7 +140,8 @@ function initHome() {
       const t = await api("POST", "/tasks", { text: $("share").value, code });
       localStorage.setItem(CARD_STORE, code);
       const list = history();
-      list.unshift({ page: t.page, url: t.url, created_at: t.created_at, expires_at: t.page_expires_at, remaining: t.remaining });
+      list.unshift({ page: t.page, url: t.url, created_at: t.created_at, expires_at: t.page_expires_at,
+                     remaining: t.remaining, cost: t.cost });
       localStorage.setItem(HISTORY_STORE, JSON.stringify(list));
       location.href = t.page;
     } catch (e) {
@@ -165,6 +171,7 @@ function renderTask(t) {
     <div class="meta">分享链接：${esc(t.url)}</div>
     <div class="meta">提交于 ${esc(localTime(t.created_at))}，本页过期于 ${esc(new Date(pageExp).toLocaleString())}</div>`;
   const mine = history().find(h => h.page === location.pathname);
+  if (mine && mine.cost != null) html += `<div class="meta">本次扣费 ${esc(mine.cost)} 次</div>`;
   if (mine && mine.remaining != null) html += `<div class="meta">本次提交后卡密剩余 ${esc(mine.remaining)} 次</div>`;
   if (ACTIVE.includes(t.status)) html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
   if (ACTIVE.includes(t.status)) html += `<div class="msg info">请耐心等待，文件下载完成后才会生成下载链接。</div>`;

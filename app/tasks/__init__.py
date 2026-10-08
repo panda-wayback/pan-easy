@@ -181,6 +181,18 @@ class TaskQueue:
         url, pwd = parse_share(text)
         return self._add(url, pwd)
 
+    async def preview(self, text: str) -> dict[str, Any]:
+        """只读查询分享文件总大小，不创建任务、不转存、不下载。"""
+        url, pwd = parse_share(text)
+        flags = ["-p", pwd] if pwd else []
+        data = await self.bdpan.run_subcommand("transfer", "list", [url], flags)
+        items = [it for it in (data or {}).get("items") or [] if isinstance(it, dict)]
+        total = sum(
+            size for it in items
+            if not it.get("is_dir") and isinstance((size := it.get("size")), int)
+        )
+        return {"total_bytes": total}
+
     def list(self) -> list[dict[str, Any]]:
         return [self._view(t) for t in reversed(self._tasks.values())]
 
@@ -343,7 +355,15 @@ class TaskQueue:
             if await self._alias_if_overlap(task, items):
                 return
             # 需要转存：全局串行；锁内若判定到合并会返回 None
-            paths = await self._transfer(task, items)
+            try:
+                paths = await self._transfer(task, items)
+            except BdpanError as err:
+                if err.errno != 13045:
+                    raise
+                paths = await self._paths_from_own_pan(items)
+                if not paths:
+                    raise
+                log.info("自己分享链接：从网盘直接下载 task=%s paths=%s", task["id"], paths)
             if paths is None:
                 return
 
@@ -405,6 +425,34 @@ class TaskQueue:
                     and str(found.get("path", "")).startswith("/apps/bdpan/")):
                 return found["path"][len("/apps/bdpan/"):]
         return None
+
+    async def _find_anywhere(self, item: dict[str, Any]) -> Optional[str]:
+        """在整个网盘按同名同大小查找，返回绝对路径。"""
+        name, size = item.get("name"), item.get("size")
+        if not name:
+            return None
+        try:
+            result = await self.bdpan.run("search", [name], ["--no-dir"])
+        except BdpanError:
+            return None
+        for found in result.get("items", []) if isinstance(result, dict) else []:
+            path = found.get("path")
+            if (_entry_name(found) == name and found.get("size") == size
+                    and isinstance(path, str) and path.startswith("/")):
+                return path
+        return None
+
+    async def _paths_from_own_pan(self, items: list[dict[str, Any]]) -> Optional[list[str]]:
+        """自己分享无法转存时，按条目在全盘定位；含目录或任一找不到则返回 None。"""
+        if not items or any(it.get("is_dir") for it in items):
+            return None
+        paths = []
+        for item in items:
+            path = await self._find_anywhere(item)
+            if path is None:
+                return None
+            paths.append(path)
+        return paths
 
     # ---- 转存（全局串行） -------------------------------------------
 

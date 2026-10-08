@@ -1,5 +1,5 @@
 name: shop
-function: 对外下载服务：凭 spark-auth 按次数卡密提交分享下载（每次扣 1 次），每次提交生成 24 小时有效的专属页面查看进度与获取下载链接，服务器端调用 baidu-easy
+function: 对外下载服务：凭 spark-auth 按次数卡密按文件大小计费提交分享下载（每 100MB 扣 1 次），每次提交生成 24 小时有效的专属页面查看进度与获取下载链接，服务器端调用 baidu-easy
 modules: []
 input:
   - name: BAIDU_EASY_API_KEY
@@ -22,7 +22,7 @@ input:
     desc: 首页
   - name: POST /tasks
     type: JSON {text, code}
-    desc: text 为分享文字，code 为按次数卡密；核销卡密 1 次后创建下载任务并生成专属页面
+    desc: text 为分享文字，code 为按次数卡密；预览分享大小后按 N 次核销，成功后创建下载任务并生成专属页面
   - name: GET /t/{token}
     type: path token
     desc: 专属页面
@@ -44,7 +44,7 @@ output:
     desc: 同一个单文件自包含网页，不依赖外部 CDN；只调用本服务接口
   - name: POST /tasks
     type: JSON
-    desc: 成功时为 baidu-easy POST /api/tasks 的响应，data 额外带 page（专属页面路径 /t/{token}）、page_expires_at（ISO 8601）与 remaining（卡密剩余次数）；baidu-easy 失败时与其状态码与响应体一致
+    desc: 成功时为 baidu-easy POST /api/tasks 的响应，data 额外带 page（专属页面路径 /t/{token}）、page_expires_at（ISO 8601）、cost（本次扣费次数 N）与 remaining（核销后卡密剩余次数）；baidu-easy 创建任务失败时与其状态码与响应体一致（次数已扣不退）
   - name: GET /t/{token}/task
     type: JSON
     desc: 与 baidu-easy GET /api/tasks/{id} 的状态码与响应体一致（任务格式见 app/tasks/interface.yaml）；成功时 data 额外带 retries_left（本页面剩余重试次数）
@@ -62,8 +62,9 @@ output:
     desc: 本服务自身的错误，code 取值见 errors
 contract:
   - 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL 时拒绝启动并输出原因
-  - POST /tasks 顺序：先检查 text 含 pan.baidu.com/s/（不区分大小写）且 code 非空，不通过时不调用 spark-auth 与 baidu-easy；再调用 spark-auth POST /api/redeem {code}，核销失败时不调用 baidu-easy；核销成功后转发 {text} 给 baidu-easy
-  - 核销成功后 baidu-easy 拒绝或任务失败不退次数
+  - 计费：N = max(1, ceil(total_bytes / 100_000_000))，即每 100MB（1000 进制）1 次，不足按 1 次；1GB=10 次
+  - POST /tasks 顺序：先检查 text 含 pan.baidu.com/s/（不区分大小写）且 code 非空，不通过时不调用 spark-auth 与 baidu-easy；再调用 baidu-easy POST /api/tasks/preview 取 total_bytes 并算 N，预览失败时不调用 spark-auth、不创建任务；再调用 spark-auth POST /api/redeem/status {code}，remaining < N 时返回 card_used、不核销、不创建任务；够则调用 POST /api/redeem {code, count:N}，核销失败时不创建任务；核销成功后转发 {text} 给 baidu-easy POST /api/tasks
+  - 核销成功后 baidu-easy 拒绝创建或之后任务失败不退次数
   - 卡密不转发给 baidu-easy，不出现在任何响应与专属页面网址中
   - 专属页面凭证包含任务 ID 与过期时间（提交后 24 小时），以主密钥签名；篡改、伪造或过期的凭证不调用 baidu-easy
   - /t/{token}/* 与 /dl 不需要卡密，凭证即授权
@@ -72,13 +73,13 @@ contract:
   - 重试记录（页面对应的当前任务与已重试次数）写入 SHOP_RETRIES_FILE（先写临时文件再替换），重启后仍在；同一页面的新旧网址共享记录；页面过期的记录在写入时删除
   - 重试不延长页面过期时间
   - 下载链接有效期为专属页面剩余时间；剩余不足 60 秒按已过期处理
-  - 不提供列出全部任务、删除与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link、POST /api/tasks/{id}/retry 与 /dl/{id}
+  - 不提供列出全部任务、删除与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks/preview、POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link、POST /api/tasks/{id}/retry 与 /dl/{id}
   - 调用 baidu-easy 时只携带主密钥，不转发用户请求的 Authorization；主密钥不出现在任何响应中
   - 下载链接域名：协议优先取请求的 X-Forwarded-Proto，主机优先取 X-Forwarded-Host，否则取请求的协议与 Host；多值时取第一个
   - 首页：填写卡密与分享文字提交，成功后跳转到专属页面
   - 首页卡密：提交成功后保存到本浏览器本地存储，下次打开首页自动填入，输入框为密码形式；提交返回 card_invalid / card_used / card_type_mismatch / card_disabled 时删除已保存的卡密；「清除」按钮清空输入框并删除已保存的卡密；输入框下提示卡密保存在本浏览器；卡密不写入历史记录与专属页面
-  - 首页历史：列出本浏览器提交过且未过期的专属页面，历史记录带提交后的剩余次数
-  - 专属页面：显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间，本浏览器历史中有该页面时显示卡密剩余次数，不显示卡密；未结束时每 2 秒刷新；完成的单文件任务有「下载文件」「复制链接」，完成的多文件任务提示暂不支持；失败或中断时有剩余次数时显示「重试（剩余 N 次）」，用完时提示重试次数已用完；过期或无效时提示；始终有返回首页的按钮
+  - 首页历史：列出本浏览器提交过且未过期的专属页面，历史记录带提交后的剩余次数与本次扣费次数
+  - 专属页面：显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间，本浏览器历史中有该页面时显示卡密剩余次数与本次扣费次数，不显示卡密；未结束时每 2 秒刷新；完成的单文件任务有「下载文件」「复制链接」，完成的多文件任务提示暂不支持；失败或中断时有剩余重试次数时显示「重试（剩余 N 次）」，用完时提示重试次数已用完；过期或无效时提示；始终有返回首页的按钮
   - 接口错误显示 error.code 与 message，有 hint 时优先显示 hint
 depends:
   - app/api
@@ -110,8 +111,10 @@ errors:
 tests:
   - 用替身 baidu-easy 与替身 spark-auth 测试
   - 提交检查：没有分享链接、卡密为空、请求不是 JSON 对象时返回 400 invalid_argument，不调用 spark-auth 与 baidu-easy
-  - 核销失败：spark-auth 各错误码映射为对应 code 与 403，不调用 baidu-easy；spark-auth 无法连接或返回非 JSON 时返回 502 auth_unavailable
-  - 提交：先核销再转发；核销请求只带 code；转发到 baidu-easy 时只带 {text} 与主密钥；成功响应带 page、page_expires_at（约 24 小时后）与 remaining；baidu-easy 失败响应原样返回且不带 page
+  - 预览失败：baidu-easy preview 返回错误时原样转发且不调用 spark-auth、不创建任务
+  - 余额不足：status 返回 remaining < N 时返回 403 card_used，不调用 redeem、不创建任务
+  - 核销失败：spark-auth redeem 各错误码映射为对应 code 与 403，不创建任务；spark-auth 无法连接或返回非 JSON 时返回 502 auth_unavailable
+  - 提交：顺序为 preview → redeem/status → redeem(count=N) → POST /api/tasks；计费 50MB→1、100MB→1、150MB→2、1GB→10；转发创建任务时只带 {text} 与主密钥；成功响应带 page、page_expires_at（约 24 小时后）、cost 与 remaining；创建任务失败响应原样返回且不带 page（次数已扣）
   - 不提供列表：GET /tasks、GET /tasks/{id} 不调用 baidu-easy
   - 网页：GET /、GET /t/{token} 无需卡密；首页含卡密「清除」按钮与保存在本浏览器的提示
   - 专属页面：凭证对应的任务与链接请求转发到正确的 baidu-easy 路径；篡改任务 ID、过期时间或签名返回 404；过期返回 410；均不调用 baidu-easy

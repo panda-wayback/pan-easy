@@ -32,6 +32,43 @@ def test_parse_share_without_link(text):
         parse_share(text)
 
 
+def test_preview_rejects_without_link(tmp_path):
+    bdpan = ScriptedBdpan([])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+    with pytest.raises(NoShareLink):
+        asyncio.run(queue.preview("没有链接"))
+    assert bdpan.calls == []
+    assert queue.list() == []
+
+
+def test_preview_returns_total_bytes_without_creating_task(tmp_path):
+    items = [
+        {"name": "a.bin", "size": 150_000_000, "is_dir": False},
+        {"name": "b.bin", "size": 50_000_000, "is_dir": False},
+        {"name": "folder", "size": 0, "is_dir": True},
+    ]
+    bdpan = ScriptedBdpan([("transfer list", {"items": items})])
+    queue = TaskQueue(bdpan, str(tmp_path), tasks_file=str(tmp_path / "tasks.json"),
+                      enable_smart_download=False)
+    got = asyncio.run(queue.preview("https://pan.baidu.com/s/1abc 提取码：abcd"))
+    assert got == {"total_bytes": 200_000_000}
+    assert bdpan.calls == [
+        ("transfer list", ["https://pan.baidu.com/s/1abc?pwd=abcd"], ["-p", "abcd"]),
+    ]
+    assert queue.list() == []
+    assert not (tmp_path / "tasks.json").exists()
+
+
+def test_preview_propagates_bdpan_error(tmp_path):
+    err = BdpanError("bdpan_error", "提取码错误", -12)
+    bdpan = ScriptedBdpan([("transfer list", err)])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+    with pytest.raises(BdpanError) as caught:
+        asyncio.run(queue.preview("https://pan.baidu.com/s/1abc?pwd=xxxx"))
+    assert caught.value is err
+    assert queue.list() == []
+
+
 # ---- 替身 --------------------------------------------------------------
 
 ITEM = {"name": "a.txt", "size": 5, "is_dir": False}
@@ -513,11 +550,36 @@ def test_retry_failed_task(tmp_path):
     assert queue.retry(new["id"]) is None
 
 
-def test_failure_keeps_error_and_hint(tmp_path):
+def test_own_share_downloads_from_pan(tmp_path):
+    """errno 13045：全盘找到同名同大小文件后直接下载。"""
+    target = str(tmp_path / "5") + "/"
+    message = "转存失败: 分享接口失败: errno=13045, msg=prohibit transfer self share link"
+    elsewhere = {"path": "/我的资源/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False}
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", BdpanError("bdpan_error", message, 13045)),
+        ("search", {"items": [elsewhere]}),
+        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done" and got["saved_to"] == "5/a.txt"
+    assert [c[0] for c in bdpan.calls] == ["transfer list", "transfer", "search", "download"]
+    assert bdpan.calls[-1][1] == ["/我的资源/a.txt", target]
+
+
+def test_own_share_not_found_keeps_13045(tmp_path):
     message = "转存失败: 分享接口失败: errno=13045, msg=prohibit transfer self share link"
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("transfer", BdpanError("bdpan_error", message, 13045)),
+        ("search", {"items": []}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
@@ -530,6 +592,27 @@ def test_failure_keeps_error_and_hint(tmp_path):
     assert got["status"] == "failed"
     assert got["error"] == {"code": "bdpan_error", "message": message, "errno": 13045,
                             "hint": "这是你自己账号分享的链接，百度不允许转存自己的分享；文件本来就在你的网盘里"}
+    assert got["finished_at"]
+    assert [c[0] for c in bdpan.calls] == ["transfer list", "transfer", "search"]
+
+
+def test_failure_keeps_error_and_hint(tmp_path):
+    message = "转存失败: 分享接口失败: errno=13004, msg=share not found"
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", BdpanError("bdpan_error", message, 13004)),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "failed"
+    assert got["error"] == {"code": "bdpan_error", "message": message, "errno": 13004,
+                            "hint": "分享链接已失效、已取消或不存在"}
     assert got["finished_at"]
 
 
