@@ -17,6 +17,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+from app.tasks import parse_max_task_bytes
+
 PAGE = Path(__file__).resolve().parent / "index.html"
 PAGE_TTL = 86400
 RETRY_LIMIT = 3
@@ -114,7 +116,9 @@ def create_app(
     transport: Optional[httpx.AsyncBaseTransport] = None,
     auth_transport: Optional[httpx.AsyncBaseTransport] = None,
     retries_file: Optional[str] = None,
+    max_task_bytes: Optional[int] = None,
 ) -> FastAPI:
+    limit = parse_max_task_bytes(max_task_bytes)
     client = httpx.AsyncClient(base_url=upstream_url, transport=transport, timeout=60.0)
     auth = httpx.AsyncClient(base_url=auth_url, transport=auth_transport, timeout=15.0)
     # 专属页面（以首次提交的任务 ID 标识）→ {task: 当前任务 ID, count: 已重试次数, exp: 页面过期时间}
@@ -218,6 +222,16 @@ def create_app(
         total_bytes = preview_data.get("total_bytes") if isinstance(preview_data, dict) else None
         if not isinstance(total_bytes, int) or total_bytes < 0:
             return _unavailable()
+        if total_bytes > limit:
+            return _error(
+                "task_too_large",
+                f"分享文件总大小超过上限（{limit} 字节），请缩小后重试",
+                409,
+            )
+        space = await forward(
+            "POST", "/api/tasks/space-check", json.dumps({"bytes": total_bytes}).encode())
+        if space.status_code != 200:
+            return space
         uses = cost_uses(total_bytes)
         names = preview_data.get("names") if isinstance(preview_data, dict) else None
         title = title_from_names(names) if isinstance(names, list) else None
@@ -325,6 +339,11 @@ def main() -> None:
     auth_url = os.environ.get("SPARK_AUTH_URL", "")
     if not api_key or not auth_url:
         print("shop: 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL，拒绝启动", file=sys.stderr)
+        sys.exit(1)
+    try:
+        parse_max_task_bytes()
+    except ValueError as err:
+        print(f"shop: {err}，拒绝启动", file=sys.stderr)
         sys.exit(1)
     host, port = _parse_addr(os.environ.get("SHOP_ADDR", ":8081"))
     upstream = os.environ.get("BAIDU_EASY_URL", "http://127.0.0.1:8080")

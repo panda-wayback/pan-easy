@@ -7,7 +7,7 @@ from datetime import datetime
 import pytest
 
 from app.bdpan import BdpanError
-from app.tasks import NoShareLink, TaskQueue, parse_share
+from app.tasks import NoShareLink, TaskQueue, parse_max_task_bytes, parse_share
 
 
 def _pan_dir_re() -> re.Pattern:
@@ -405,6 +405,7 @@ def test_dir_share_expands_to_single_file(tmp_path):
     }
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [folder]}),
+        ("transfer list", {"items": [folder]}),  # 大小校验：目录无 path 时无法递归
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [{"path": "/apps/bdpan/d/book", "server_filename": "book", "size": 0, "isdir": True}]),
         ("ls", [inner]),  # 展开目录
@@ -437,6 +438,7 @@ def test_dir_share_expands_to_zip(tmp_path):
     ]
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [folder]}),
+        ("transfer list", {"items": [folder]}),  # 大小校验
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [{"path": "/apps/bdpan/d/pack", "server_filename": "pack", "size": 0, "isdir": True}]),
         ("ls", files),
@@ -460,6 +462,7 @@ def test_dir_share_empty_fails(tmp_path):
     folder = {"name": "empty", "size": 0, "is_dir": True}
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [folder]}),
+        ("transfer list", {"items": [folder]}),  # 大小校验
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [{"path": "/apps/bdpan/d/empty", "server_filename": "empty", "size": 0, "isdir": True}]),
         ("ls", []),  # 空目录
@@ -1202,5 +1205,146 @@ def test_failure_keeps_error_and_hint(tmp_path):
     assert got["error"] == {"code": "bdpan_error", "message": message, "errno": 13004,
                             "hint": "分享链接已失效、已取消或不存在"}
     assert got["finished_at"]
+
+
+# ---- 下载空间控制 ------------------------------------------------------
+
+def test_parse_max_task_bytes_rejects_non_positive():
+    assert parse_max_task_bytes(10) == 10
+    with pytest.raises(ValueError):
+        parse_max_task_bytes(0)
+    with pytest.raises(ValueError):
+        parse_max_task_bytes(-1)
+
+
+def test_task_too_large_fails_without_transfer(tmp_path):
+    big = {"name": "a.bin", "size": 1000, "is_dir": False}
+    bdpan = ScriptedBdpan([("transfer list", {"items": [big]})])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False, max_task_bytes=500,
+                      cleanup_interval=0)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1big")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "failed"
+    assert got["error"]["code"] == "task_too_large"
+    assert [c[0] for c in bdpan.calls] == ["transfer list"]
+
+
+def test_preview_still_returns_oversized_total(tmp_path):
+    big = {"name": "a.bin", "size": 1000, "is_dir": False}
+    bdpan = ScriptedBdpan([("transfer list", {"items": [big]})])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False, max_task_bytes=500,
+                      cleanup_interval=0)
+    got = asyncio.run(queue.preview("https://pan.baidu.com/s/1big"))
+    assert got["total_bytes"] == 1000
+
+
+def test_disk_full_after_cleanup_fails(tmp_path, monkeypatch):
+    bdpan = ScriptedBdpan(_single_steps()(str(tmp_path / "5")))
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False, max_task_bytes=10_000,
+                      cleanup_interval=0, cleanup_min_age=0)
+    monkeypatch.setattr(queue, "_free_bytes", lambda: 0)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "failed"
+    assert got["error"]["code"] == "disk_full"
+
+
+def test_ensure_space_deletes_cold_deliverable(tmp_path, monkeypatch):
+    # 放在其它 size 桶，避免同名同大小被本地缓存命中而跳过腾空间
+    cold = tmp_path / "999" / "old" / "junk.bin"
+    cold.parent.mkdir(parents=True)
+    cold.write_bytes(b"xxxxx")
+    os.utime(cold, (1, 1))
+
+    free = {"n": 0}
+
+    bdpan = ScriptedBdpan(_single_steps()(str(tmp_path / "5")))
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False, max_task_bytes=10_000,
+                      cleanup_interval=0, cleanup_min_age=0)
+    monkeypatch.setattr(queue, "_free_bytes", lambda: free["n"])
+    real_remove = queue._remove_path
+
+    def remove_and_free(path):
+        real_remove(path)
+        free["n"] = 1000
+
+    monkeypatch.setattr(queue, "_remove_path", remove_and_free)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert not cold.exists()
+
+
+def test_touch_download_and_local_cache_refresh_mtime(tmp_path):
+    dest = tmp_path / "5" / "prev" / "a.txt"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"hello")
+    os.utime(dest, (10, 10))
+    bdpan = ScriptedBdpan([("transfer list", {"items": [ITEM]})])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False, cleanup_interval=0)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert os.path.getmtime(dest) > 10
+    before = os.path.getmtime(dest)
+    os.utime(dest, (20, 20))
+    queue.touch_download(f"5/prev/a.txt")
+    assert os.path.getmtime(dest) > 20
+
+
+def test_cleanup_cold_respects_min_age(tmp_path):
+    cold = tmp_path / "5" / "old" / "a.txt"
+    cold.parent.mkdir(parents=True)
+    cold.write_bytes(b"xxxxx")
+    os.utime(cold, (1, 1))
+    hot = tmp_path / "5" / "new" / "a.txt"
+    hot.parent.mkdir(parents=True)
+    hot.write_bytes(b"xxxxx")
+    # hot 保持当前 mtime
+    queue = TaskQueue(ScriptedBdpan([]), str(tmp_path), cleanup_interval=0, cleanup_min_age=3600)
+    queue.cleanup_cold()
+    assert not cold.exists()
+    assert hot.exists()
+
+
+def test_sweep_does_not_delete_hot_file_when_dir_mtime_old(tmp_path):
+    """父目录 mtime 很旧、但文件刚被 touch 时，不得整目录删掉。"""
+    hot = tmp_path / "5" / "keep" / "a.txt"
+    hot.parent.mkdir(parents=True)
+    hot.write_bytes(b"hello")
+    os.utime(hot, None)  # 文件是新的
+    os.utime(hot.parent, (1, 1))  # 目录很旧
+    queue = TaskQueue(ScriptedBdpan([]), str(tmp_path), cleanup_interval=0, cleanup_min_age=3600)
+    queue.cleanup_cold()
+    assert hot.exists()
+
+
+def test_check_space_raises_disk_full(tmp_path, monkeypatch):
+    from app.tasks import DiskFull
+
+    queue = TaskQueue(ScriptedBdpan([]), str(tmp_path), cleanup_interval=0, cleanup_min_age=0)
+    monkeypatch.setattr(queue, "_free_bytes", lambda: 0)
+    with pytest.raises(DiskFull):
+        queue.check_space(100)
 
 

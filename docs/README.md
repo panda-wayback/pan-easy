@@ -12,4 +12,5 @@
 - [文件传输](server/file-transfer/README.md)：请求体上传、文件流下载，无需共享目录
 - [测试网页](server/web/README.md)：服务自带的下载与登录测试网页
 - [分享下载](server/share-download/README.md)：粘贴分享文字，后台逐个下载
+- [下载空间控制](server/download-space/README.md)：单次下载大小上限与冷文件定时清理，防止下载目录占满磁盘
 - [对外下载服务](server/public-service/README.md)：面向付费用户的独立下载网站，凭按次数卡密使用

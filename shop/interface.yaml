@@ -17,6 +17,9 @@ input:
   - name: SHOP_RETRIES_FILE
     type: env string
     desc: 专属页面重试记录文件；默认 shop-retries.json，镜像内为 /data/shop-retries.json
+  - name: BAIDU_EASY_MAX_TASK_BYTES
+    type: env integer
+    desc: 与 baidu-easy 相同的单次任务大小上限（字节，1000 进制）；默认 10000000000；必须 > 0
   - name: GET /
     type: 无参数
     desc: 首页
@@ -61,9 +64,9 @@ output:
     type: JSON {ok:false, error:{code, message}}
     desc: 本服务自身的错误，code 取值见 errors
 contract:
-  - 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL 时拒绝启动并输出原因
+  - 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL 时拒绝启动并输出原因；BAIDU_EASY_MAX_TASK_BYTES 缺省为 10000000000，非法（非正整数）时拒绝启动
   - 计费：N = max(1, ceil(total_bytes / 100_000_000))，即每 100MB（1000 进制）1 次，不足按 1 次；1GB=10 次
-  - POST /tasks 顺序：先检查 text 含 pan.baidu.com/s/（不区分大小写）且 code 非空，不通过时不调用 spark-auth 与 baidu-easy；再调用 baidu-easy POST /api/tasks/preview 取 total_bytes 与 names 并算 N，预览失败时不调用 spark-auth、不创建任务；再调用 spark-auth POST /api/redeem/status {code}，remaining < N 时返回 card_used、不核销、不创建任务；够则调用 POST /api/redeem {code, count:N}，核销失败时不创建任务；核销成功后转发 {text} 给 baidu-easy POST /api/tasks
+  - POST /tasks 顺序：先检查 text 含 pan.baidu.com/s/（不区分大小写）且 code 非空，不通过时不调用 spark-auth 与 baidu-easy；再调用 baidu-easy POST /api/tasks/preview 取 total_bytes 与 names 并算 N，预览失败时不调用 spark-auth、不创建任务；若 total_bytes 大于 BAIDU_EASY_MAX_TASK_BYTES 则返回 task_too_large，不调用 spark-auth、不创建任务；再调用 baidu-easy POST /api/tasks/space-check {bytes:total_bytes}，失败（含 disk_full）时原样返回且不调用 spark-auth、不创建任务；再调用 spark-auth POST /api/redeem/status {code}，remaining < N 时返回 card_used、不核销、不创建任务；够则调用 POST /api/redeem {code, count:N}，核销失败时不创建任务；核销成功后转发 {text} 给 baidu-easy POST /api/tasks
   - title：由 preview.names 生成；1 个文件为该文件名；多个为「首个文件名 等N个文件」；names 为空时不带 title
   - 核销成功后 baidu-easy 拒绝创建或之后任务失败不退次数
   - 卡密不转发给 baidu-easy，不出现在任何响应与专属页面网址中
@@ -74,7 +77,7 @@ contract:
   - 重试记录（页面对应的当前任务与已重试次数）写入 SHOP_RETRIES_FILE（先写临时文件再替换），重启后仍在；同一页面的新旧网址共享记录；页面过期的记录在写入时删除
   - 重试不延长页面过期时间
   - 下载链接有效期为专属页面剩余时间；剩余不足 60 秒按已过期处理
-  - 不提供列出全部任务、删除与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks/preview、POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link、POST /api/tasks/{id}/retry 与 /dl/{id}
+  - 不提供列出全部任务、删除与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks/preview、POST /api/tasks/space-check、POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link、POST /api/tasks/{id}/retry 与 /dl/{id}
   - 调用 baidu-easy 时只携带主密钥，不转发用户请求的 Authorization；主密钥不出现在任何响应中
   - 下载链接域名：协议优先取请求的 X-Forwarded-Proto，主机优先取 X-Forwarded-Host，否则取请求的协议与 Host；多值时取第一个
   - 首页：填写卡密与分享文字提交，成功后跳转到专属页面
@@ -86,7 +89,7 @@ depends:
   - app/api
 errors:
   - code: config_missing
-    desc: 未配置主密钥或卡密服务地址；进程以非零码退出
+    desc: 未配置主密钥或卡密服务地址，或 BAIDU_EASY_MAX_TASK_BYTES 非法；进程以非零码退出
   - code: invalid_argument
     desc: 请求不是 JSON 对象、text 中没有百度网盘分享链接或 code 为空；HTTP 400
   - code: card_invalid
@@ -107,15 +110,21 @@ errors:
     desc: 下载链接中的任务 ID 格式不合法；HTTP 404
   - code: retry_exhausted
     desc: 本页面重试次数已用完；HTTP 409
+  - code: task_too_large
+    desc: 预览总大小超过 BAIDU_EASY_MAX_TASK_BYTES；HTTP 409
+  - code: disk_full
+    desc: 下载目录腾空间后仍不足（来自 baidu-easy space-check）；HTTP 507；不扣次数
   - code: upstream_unavailable
     desc: baidu-easy 无法连接、拒绝主密钥或返回非 JSON；HTTP 502
 tests:
   - 用替身 baidu-easy 与替身 spark-auth 测试
   - 提交检查：没有分享链接、卡密为空、请求不是 JSON 对象时返回 400 invalid_argument，不调用 spark-auth 与 baidu-easy
   - 预览失败：baidu-easy preview 返回错误时原样转发且不调用 spark-auth、不创建任务
+  - 超限：preview.total_bytes 大于上限时返回 409 task_too_large，不调用 spark-auth、不创建任务
+  - 空间不足：space-check 返回 disk_full 时原样返回（507），不调用 spark-auth、不创建任务
   - 余额不足：status 返回 remaining < N 时返回 403 card_used，不调用 redeem、不创建任务
   - 核销失败：spark-auth redeem 各错误码映射为对应 code 与 403，不创建任务；spark-auth 无法连接或返回非 JSON 时返回 502 auth_unavailable
-  - 提交：顺序为 preview → redeem/status → redeem(count=N) → POST /api/tasks；计费 50MB→1、100MB→1、150MB→2、1GB→10；转发创建任务时只带 {text} 与主密钥；成功响应带 page、page_expires_at（约 24 小时后）、cost、remaining 与 title（由 names 生成）；创建任务失败响应原样返回且不带 page（次数已扣）
+  - 提交：顺序为 preview → space-check → redeem/status → redeem(count=N) → POST /api/tasks；计费 50MB→1、100MB→1、150MB→2、1GB→10；转发创建任务时只带 {text} 与主密钥；成功响应带 page、page_expires_at（约 24 小时后）、cost、remaining 与 title（由 names 生成）；创建任务失败响应原样返回且不带 page（次数已扣）
   - title：单文件为文件名；多文件为「首名 等N个文件」；preview 无 names 时响应不含 title
   - 不提供列表：GET /tasks、GET /tasks/{id} 不调用 baidu-easy
   - 网页：GET /、GET /t/{token} 无需卡密；首页含卡密「清除」按钮与保存在本浏览器的提示

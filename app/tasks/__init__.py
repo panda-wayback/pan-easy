@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -14,6 +16,10 @@ from urllib.parse import parse_qs, urlsplit
 from app.bdpan import BdpanError
 
 log = logging.getLogger("baidu_easy.tasks")
+
+DEFAULT_MAX_TASK_BYTES = 10_000_000_000
+DEFAULT_CLEANUP_INTERVAL = 3600
+DEFAULT_CLEANUP_MIN_AGE = 604800
 
 _SHARE_RE = re.compile(r"https?://pan\.baidu\.com/s/[A-Za-z0-9_\-]+(?:\?[A-Za-z0-9=&_\-]*)?")
 _PWD_TEXT_RE = re.compile(r"提取码\s*[:：]?\s*([A-Za-z0-9]{4})")
@@ -37,6 +43,53 @@ class NoShareLink(ValueError):
 
 class _TransferTimeout(Exception):
     pass
+
+
+class _TaskFail(Exception):
+    """任务业务失败（非 bdpan），带稳定 error.code。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class DiskFull(Exception):
+    """下载目录腾空间后仍不足。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def parse_max_task_bytes(value: Optional[Any] = None, env: bool = True) -> int:
+    """解析单次任务大小上限；必须为正整数。value 优先，否则读环境变量，再默认。"""
+    if value is not None:
+        try:
+            n = int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError("BAIDU_EASY_MAX_TASK_BYTES 必须为正整数") from e
+        if n <= 0:
+            raise ValueError("BAIDU_EASY_MAX_TASK_BYTES 必须为正整数")
+        return n
+    if env:
+        raw = os.getenv("BAIDU_EASY_MAX_TASK_BYTES")
+        if raw is not None and raw != "":
+            return parse_max_task_bytes(raw, env=False)
+    return DEFAULT_MAX_TASK_BYTES
+
+
+def _nonneg_int(name: str, default: int, value: Optional[Any] = None) -> int:
+    if value is not None:
+        n = int(value)
+    else:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        n = int(raw)
+    if n < 0:
+        raise ValueError(f"{name} 不能为负")
+    return n
 
 
 def _pan_dir(path: Any) -> Optional[str]:
@@ -112,7 +165,9 @@ def _now() -> str:
 
 class TaskQueue:
     def __init__(self, bdpan, download_dir: str, tasks_file: Optional[str] = None, enable_smart_download: bool = None,
-                 transfer_timeout: float = 1800, transfer_poll_interval: float = 10, max_downloads: Optional[int] = None):
+                 transfer_timeout: float = 1800, transfer_poll_interval: float = 10, max_downloads: Optional[int] = None,
+                 max_task_bytes: Optional[int] = None, cleanup_interval: Optional[int] = None,
+                 cleanup_min_age: Optional[int] = None):
         self.bdpan = bdpan
         self.download_dir = download_dir
         self.tasks_file = tasks_file
@@ -128,9 +183,15 @@ class TaskQueue:
             except ValueError:
                 max_downloads = 2
         self.max_downloads = max(1, max_downloads)
+        self.max_task_bytes = parse_max_task_bytes(max_task_bytes)
+        self.cleanup_interval = _nonneg_int(
+            "BAIDU_EASY_CLEANUP_INTERVAL", DEFAULT_CLEANUP_INTERVAL, cleanup_interval)
+        self.cleanup_min_age = _nonneg_int(
+            "BAIDU_EASY_CLEANUP_MIN_AGE", DEFAULT_CLEANUP_MIN_AGE, cleanup_min_age)
         self._tasks: dict[str, dict[str, Any]] = {}
         self._ready: Optional[asyncio.Queue] = None
         self._scheduler: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._download_slots: Optional[asyncio.Semaphore] = None
         self._running: set[asyncio.Task] = set()
         self._seq = 0
@@ -243,6 +304,20 @@ class TaskQueue:
         log.info("任务已删除 task=%s", task_id)
         return True
 
+    def touch_download(self, rel: str) -> None:
+        """刷新下载目录内交付物的最近使用时间（mtime）；越界或不存在则忽略。"""
+        if not rel or rel == "." or ".." in rel.split(os.sep) or ".." in rel.split("/"):
+            return
+        root = os.path.realpath(self.download_dir)
+        path = os.path.realpath(os.path.join(root, rel))
+        if path != root and not path.startswith(root + os.sep):
+            return
+        if os.path.isfile(path):
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
+
     def retry(self, task_id: str) -> Optional[dict[str, Any]]:
         """重试失败或中断的任务：复制原分享链接与提取码，新建任务 ID 排队；原记录保留。"""
         task = self._tasks.get(task_id)
@@ -297,7 +372,10 @@ class TaskQueue:
             for tid, t in self._tasks.items():
                 if t["status"] == "queued":
                     self._ready.put_nowait(tid)
-            self._scheduler = asyncio.get_running_loop().create_task(self._schedule())
+            loop = asyncio.get_running_loop()
+            self._scheduler = loop.create_task(self._schedule())
+            if self.cleanup_interval > 0 and (self._cleanup_task is None or self._cleanup_task.done()):
+                self._cleanup_task = loop.create_task(self._cleanup_loop())
 
     async def _schedule(self) -> None:
         while True:
@@ -309,6 +387,14 @@ class TaskQueue:
             task["_run"] = run
             self._running.add(run)
             run.add_done_callback(self._running.discard)
+
+    async def _cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cleanup_interval)
+            try:
+                self.cleanup_cold()
+            except Exception:
+                log.exception("定时清理下载目录失败")
 
     async def _process(self, task: dict[str, Any]) -> None:
         try:
@@ -335,6 +421,16 @@ class TaskQueue:
                     error={"code": "transfer_timeout", "message": str(err), "errno": None, "hint": None},
                 )
                 self._save()
+        except _TaskFail as err:
+            if task.get("status") in ("queued", "running", "submitted"):
+                task.update(
+                    status="failed",
+                    speed=None,
+                    eta=None,
+                    finished_at=_now(),
+                    error={"code": err.code, "message": err.message, "errno": None, "hint": None},
+                )
+                self._save()
         except Exception as err:
             if task.get("status") in ("queued", "running", "submitted"):
                 task.update(
@@ -359,6 +455,13 @@ class TaskQueue:
         if not items:
             raise ValueError("分享链接无效或已失效")
         task["_items"] = items
+
+        total_bytes = await self._share_total_bytes(task, items)
+        if total_bytes > self.max_task_bytes:
+            raise _TaskFail(
+                "task_too_large",
+                f"分享文件总大小 {total_bytes} 字节超过上限 {self.max_task_bytes} 字节",
+            )
 
         # 第一步：本地缓存（单文件与多文件 zip 均复用已有 downloads）
         cached = self._reuse_local(task, items)
@@ -398,6 +501,8 @@ class TaskQueue:
             # 获取名额后可能已有相同任务先开始下载，再判定一次
             if await self._alias_if_overlap(task, items):
                 return
+            need = sum(s for _, s in self._file_entries(items))
+            self._ensure_space(need)
             target_dir = self._target_dir(task, items)
             self._prepare_target_dir(target_dir)
             try:
@@ -516,6 +621,7 @@ class TaskQueue:
                     downloaded=total or None, speed=None, eta=None, finished_at=_now())
         task["error"] = {"code": "local_exists", "message": "文件已在本地下载目录", "errno": None,
                          "hint": f"跳过下载：downloads/{rel}"}
+        self.touch_download(rel)
         self._save()
         log.info("任务完成（本地缓存命中） task=%s saved_to=%s", task["id"], rel)
         return True
@@ -526,6 +632,201 @@ class TaskQueue:
         flags = ["-p", task["pwd"]] if task.get("pwd") else []
         data = await self.bdpan.run_subcommand("transfer", "list", [task["url"]], flags)
         return [it for it in (data or {}).get("items") or [] if isinstance(it, dict)]
+
+    async def _share_total_bytes(self, task: dict[str, Any], items: list[dict[str, Any]]) -> int:
+        """分享文件总大小（与 preview 一致：含目录内文件，1000 进制字节）。"""
+        if any(it.get("is_dir") for it in items):
+            files = await self._list_share_files(task["url"], task.get("pwd"))
+            return sum(s for it in files if isinstance((s := it.get("size")), int))
+        return sum(s for _, s in self._file_entries(items))
+
+    # ---- 空间与清理 -------------------------------------------------
+
+    def _free_bytes(self) -> int:
+        st = os.statvfs(self.download_dir)
+        return int(st.f_bavail * st.f_frsize)
+
+    def _protected_paths(self) -> set[str]:
+        """进行中任务的工作目录与目标 zip，清理时跳过。"""
+        out: set[str] = set()
+        for t in self._tasks.values():
+            if t.get("status") not in ("queued", "running", "submitted"):
+                continue
+            items = t.get("_items")
+            if not items:
+                continue
+            try:
+                out.add(os.path.realpath(self._target_dir(t, items)))
+                zip_path = os.path.join(self.download_dir, self._size_key(items), f"{t['id']}.zip")
+                out.add(os.path.realpath(zip_path))
+            except (OSError, TypeError, ValueError):
+                continue
+        return out
+
+    def _list_deliverables(self) -> list[tuple[float, str, int]]:
+        """交付物列表：(mtime, abs_path, size)。单文件与 zip。"""
+        root = os.path.realpath(self.download_dir)
+        found: list[tuple[float, str, int]] = []
+        try:
+            size_dirs = os.listdir(self.download_dir)
+        except OSError:
+            return found
+        for size_dir in size_dirs:
+            size_path = os.path.join(self.download_dir, size_dir)
+            if not os.path.isdir(size_path):
+                continue
+            try:
+                entries = os.listdir(size_path)
+            except OSError:
+                continue
+            for entry in entries:
+                path = os.path.join(size_path, entry)
+                if entry.endswith(".zip") and os.path.isfile(path):
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        continue
+                    found.append((st.st_mtime, os.path.realpath(path), st.st_size))
+                elif os.path.isdir(path):
+                    try:
+                        names = os.listdir(path)
+                    except OSError:
+                        continue
+                    for name in names:
+                        fp = os.path.join(path, name)
+                        if not os.path.isfile(fp):
+                            continue
+                        try:
+                            st = os.stat(fp)
+                        except OSError:
+                            continue
+                        found.append((st.st_mtime, os.path.realpath(fp), st.st_size))
+        return [(m, p, s) for m, p, s in found if p.startswith(root + os.sep)]
+
+    def _remove_path(self, path: str) -> None:
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            return
+        parent = os.path.dirname(path)
+        root = os.path.realpath(self.download_dir)
+        while parent.startswith(root + os.sep) or parent == root:
+            if parent == root:
+                break
+            try:
+                if os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+                    parent = os.path.dirname(parent)
+                else:
+                    break
+            except OSError:
+                break
+
+    def _sweep_orphan_workdirs(self, protected: set[str], min_mtime: float) -> None:
+        """删除无运行中任务的残留工作目录：空目录，或目录内全部文件均已闲置超过阈值。
+
+        不以目录自身 mtime 为准（对文件 utime 不一定更新父目录），避免误删仍在用的单文件交付物。
+        """
+        try:
+            size_dirs = os.listdir(self.download_dir)
+        except OSError:
+            return
+        for size_dir in size_dirs:
+            size_path = os.path.join(self.download_dir, size_dir)
+            if not os.path.isdir(size_path):
+                continue
+            try:
+                entries = os.listdir(size_path)
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.endswith(".zip"):
+                    continue
+                path = os.path.join(size_path, entry)
+                real = os.path.realpath(path)
+                if not os.path.isdir(path) or real in protected:
+                    continue
+                try:
+                    names = os.listdir(path)
+                except OSError:
+                    continue
+                if not names:
+                    self._remove_path(path)
+                    continue
+                all_cold = True
+                for name in names:
+                    fp = os.path.join(path, name)
+                    if os.path.isdir(fp):
+                        all_cold = False
+                        break
+                    if not os.path.isfile(fp):
+                        continue
+                    try:
+                        if os.path.getmtime(fp) > min_mtime:
+                            all_cold = False
+                            break
+                    except OSError:
+                        all_cold = False
+                        break
+                if all_cold:
+                    self._remove_path(path)
+
+    def cleanup_cold(self, need_bytes: Optional[int] = None) -> int:
+        """清理闲置超过 cleanup_min_age 的交付物。need_bytes 时删到可用空间足够为止。返回删除字节数。"""
+        os.makedirs(self.download_dir, exist_ok=True)
+        protected = self._protected_paths()
+        cutoff = time.time() - self.cleanup_min_age
+        candidates = [
+            (mtime, path, size) for mtime, path, size in self._list_deliverables()
+            if mtime <= cutoff and path not in protected
+            and not any(path.startswith(p + os.sep) for p in protected if os.path.isdir(p))
+        ]
+        candidates.sort(key=lambda x: x[0])  # 最久未用优先
+        removed = 0
+        for _mtime, path, size in candidates:
+            if need_bytes is not None and self._free_bytes() >= need_bytes:
+                break
+            self._remove_path(path)
+            removed += size
+        # 腾空间已够时仍扫空/全冷残留目录，但不依赖目录 mtime
+        self._sweep_orphan_workdirs(protected, cutoff)
+        try:
+            for size_dir in os.listdir(self.download_dir):
+                size_path = os.path.join(self.download_dir, size_dir)
+                if os.path.isdir(size_path) and not os.listdir(size_path):
+                    try:
+                        os.rmdir(size_path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return removed
+
+    def check_space(self, need_bytes: int) -> int:
+        """按需清理冷文件后检查可用空间；足够则返回当前可用字节，不足则抛 DiskFull。"""
+        try:
+            self._ensure_space(need_bytes)
+        except _TaskFail as err:
+            if err.code == "disk_full":
+                raise DiskFull(err.message) from None
+            raise
+        return self._free_bytes()
+
+    def _ensure_space(self, need_bytes: int) -> None:
+        if need_bytes <= 0:
+            return
+        os.makedirs(self.download_dir, exist_ok=True)
+        if self._free_bytes() >= need_bytes:
+            return
+        self.cleanup_cold(need_bytes=need_bytes)
+        if self._free_bytes() < need_bytes:
+            raise _TaskFail(
+                "disk_full",
+                f"下载目录可用空间不足（需要 {need_bytes} 字节，清理后仍不够）",
+            )
 
     @staticmethod
     def _size_key(items: list[dict[str, Any]]) -> str:
@@ -918,6 +1219,8 @@ class TaskQueue:
         task["speed"] = None
         task["eta"] = None
         task["finished_at"] = _now()
+        if task.get("saved_to"):
+            self.touch_download(task["saved_to"])
         self._save()
         log.info("任务完成 task=%s saved_to=%s", task["id"], task.get("saved_to"))
 

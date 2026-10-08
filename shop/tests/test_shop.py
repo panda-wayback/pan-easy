@@ -48,6 +48,8 @@ def upstream():
     return Fake({
         ("POST", "/api/tasks/preview"): lambda: JSONResponse(
             {"ok": True, "data": {"total_bytes": PREVIEW_BYTES, "names": ["demo.bin"]}}),
+        ("POST", "/api/tasks/space-check"): lambda: JSONResponse(
+            {"ok": True, "data": {"free_bytes": 10_000_000_000}}),
         ("POST", "/api/tasks"): lambda: JSONResponse(
             {"ok": True, "data": {"id": "abc123", "url": SHARE, "status": "queued"}}, status_code=202),
     })
@@ -110,6 +112,29 @@ def test_submit_rejects_non_json(client, upstream, spark):
     assert upstream.calls == [] and spark.calls == []
 
 
+def test_submit_rejects_task_too_large(upstream, spark):
+    upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(
+        {"ok": True, "data": {"total_bytes": 5_000, "names": ["big.bin"]}})
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                     transport=httpx.ASGITransport(app=upstream.app),
+                     auth_transport=httpx.ASGITransport(app=spark.app),
+                     max_task_bytes=1000)
+    with TestClient(app) as client:
+        res = client.post("/tasks", json=SUBMIT)
+    assert res.status_code == 409 and res.json()["error"]["code"] == "task_too_large"
+    assert [("POST", c["path"]) for c in upstream.calls] == [("POST", "/api/tasks/preview")]
+    assert spark.calls == []
+
+
+def test_submit_rejects_disk_full_without_redeem(client, upstream, spark):
+    upstream.responses[("POST", "/api/tasks/space-check")] = lambda: JSONResponse(
+        {"ok": False, "error": {"code": "disk_full", "message": "空间不足"}}, status_code=507)
+    res = client.post("/tasks", json=SUBMIT)
+    assert res.status_code == 507 and res.json()["error"]["code"] == "disk_full"
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview", "/api/tasks/space-check"]
+    assert spark.calls == []
+
+
 @pytest.mark.parametrize("total, expected", [
     (0, 1),
     (1, 1),
@@ -148,7 +173,7 @@ def test_redeem_failure_maps_error(client, upstream, spark, spark_code, status, 
     assert res.status_code == 403 and res.json()["error"]["code"] == code
     assert CARD not in res.text
     assert [c["path"] for c in spark.calls] == ["/api/redeem/status", "/api/redeem"]
-    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview", "/api/tasks/space-check"]
 
 
 def test_redeem_unavailable(upstream):
@@ -164,7 +189,7 @@ def test_redeem_unavailable(upstream):
         with TestClient(app) as client:
             res = client.post("/tasks", json=SUBMIT)
             assert res.status_code == 502 and res.json()["error"]["code"] == "auth_unavailable"
-            assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
+            assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview", "/api/tasks/space-check"]
             upstream.calls.clear()
 
 
@@ -189,15 +214,17 @@ def test_insufficient_remaining_skips_redeem(client, upstream, spark):
     res = client.post("/tasks", json=SUBMIT)
     assert res.status_code == 403 and res.json()["error"]["code"] == "card_used"
     assert [c["path"] for c in spark.calls] == ["/api/redeem/status"]
-    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview"]
+    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview", "/api/tasks/space-check"]
 
 
 def test_submit_redeems_then_creates_page(client, upstream, spark):
     data = submit(client)
-    assert [c["path"] for c in upstream.calls] == ["/api/tasks/preview", "/api/tasks"]
+    assert [c["path"] for c in upstream.calls] == [
+        "/api/tasks/preview", "/api/tasks/space-check", "/api/tasks"]
     assert json.loads(upstream.calls[0]["body"]) == {"text": SHARE}
-    assert json.loads(upstream.calls[1]["body"]) == {"text": SHARE}
-    assert upstream.calls[1]["headers"]["authorization"] == f"Bearer {MASTER}"
+    assert json.loads(upstream.calls[1]["body"]) == {"bytes": PREVIEW_BYTES}
+    assert json.loads(upstream.calls[2]["body"]) == {"text": SHARE}
+    assert upstream.calls[2]["headers"]["authorization"] == f"Bearer {MASTER}"
 
     assert [c["path"] for c in spark.calls] == ["/api/redeem/status", "/api/redeem"]
     assert json.loads(spark.calls[0]["body"]) == {"code": CARD}

@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.bdpan import Bdpan, BdpanError
-from app.tasks import NoShareLink, TaskQueue
+from app.tasks import DiskFull, NoShareLink, TaskQueue
 
 _AUTH_CODE_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _COPY_CHUNK = 1024 * 1024
@@ -29,6 +29,8 @@ _BDPAN_STATUS = {
     "token_expired": 409,
     "bdpan_error": 502,
     "timeout": 504,
+    "task_too_large": 409,
+    "disk_full": 507,
 }
 
 
@@ -193,6 +195,10 @@ class PathsBody(BaseModel):
 
 class TaskBody(BaseModel):
     text: str
+
+
+class SpaceCheckBody(BaseModel):
+    bytes: int = Field(..., ge=0)
 
 
 class LinkBody(BaseModel):
@@ -383,6 +389,14 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
         except NoShareLink as err:
             raise _invalid(str(err)) from None
 
+    @api.post("/tasks/space-check")
+    async def space_check(body: SpaceCheckBody):
+        try:
+            free = tasks.check_space(body.bytes)
+        except DiskFull as err:
+            raise ApiError("disk_full", err.message, 507) from None
+        return _ok({"free_bytes": free})
+
     @api.get("/tasks")
     async def list_tasks():
         return _ok(tasks.list())
@@ -411,6 +425,9 @@ def create_api(bdpan: Bdpan, api_key: str, tasks: TaskQueue, tmp_dir: Optional[s
     @api.post("/tasks/{task_id}/link")
     async def task_link(request: Request, task_id: str, body: Optional[LinkBody] = Body(None)):
         _task_file(tasks, task_id)
+        task = tasks.get(task_id)
+        if task and task.get("saved_to"):
+            tasks.touch_download(task["saved_to"])
         exp = int(time.time()) + (body or LinkBody()).expires_in
         url = f"{_public_base(request)}/dl/{task_id}?exp={exp}&sig={_sign(api_key, task_id, exp)}"
         expires_at = datetime.fromtimestamp(exp, timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -453,6 +470,9 @@ def create_dl(api_key: str, tasks: TaskQueue) -> FastAPI:
         if exp < time.time():
             raise ApiError("link_invalid", "下载链接已过期，请重新生成", 403)
         path = _task_file(tasks, task_id)
+        task = tasks.get(task_id)
+        if task and task.get("saved_to"):
+            tasks.touch_download(task["saved_to"])
         return FileResponse(path, filename=path.name, media_type="application/octet-stream")
 
     return dl

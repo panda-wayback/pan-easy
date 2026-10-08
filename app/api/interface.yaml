@@ -53,6 +53,9 @@ input:
   - name: POST /api/tasks/preview
     type: JSON {text}
     desc: 只读预览分享信息，返回文件总大小；不创建任务
+  - name: POST /api/tasks/space-check
+    type: JSON {bytes}
+    desc: 按 bytes 检查下载目录可用空间（不足时先清理冷交付物）；足够返回 {free_bytes}；仍不足返回 disk_full；不创建任务
   - name: GET /api/tasks
     type: 无参数
     desc: 任务列表，新任务在前
@@ -99,6 +102,8 @@ contract:
   - 链接地址自动识别：协议优先取 X-Forwarded-Proto，主机优先取 X-Forwarded-Host，否则取生成请求的协议与 Host；多值时取第一个
   - 只对状态为 done 且 saved_to 为单个文件的任务生成链接与提供下载
   - /dl 只读取下载目录内的文件；解析后的路径不在下载目录内时拒绝
+  - 生成下载链接成功时，以及 /dl 开始传输时，调用 tasks.touch_download 刷新对应交付物最近使用时间
+  - 任务因分享过大或磁盘空间不足失败时，error.code 为 task_too_large / disk_full，HTTP 与其它任务失败一致（见 tasks 错误经统一映射）
 depends:
   - app/bdpan
   - app/tasks
@@ -127,6 +132,10 @@ errors:
     desc: bdpan 调用超时；HTTP 504
   - code: internal
     desc: 服务内部错误；HTTP 500
+  - code: task_too_large
+    desc: 分享文件总大小超过上限；HTTP 409
+  - code: disk_full
+    desc: 下载目录腾空间后仍不足；HTTP 507
 tests:
   - 用替身 bdpan 适配器做 HTTP 测试
   - 鉴权：无密钥、错误密钥返回 401；正确密钥放行
@@ -137,6 +146,7 @@ tests:
   - 适配器各类错误到 HTTP 状态码与 error.code 的映射
   - 任务接口：提交返回 202；文字无链接返回 400；列表新任务在前；未知任务返回 404
   - 预览：文字无链接返回 400；成功返回 200 与 {total_bytes, names}；bdpan 错误映射与其它接口一致；不创建任务
-  - 下载链接：完成的单文件任务生成链接后不带密钥可下载且内容一致；Range 请求返回 206；改动 sig 或 exp、过期返回 403；未完成或多文件返回 409；文件被删返回 404；expires_in 越界返回 400；带 X-Forwarded-Proto/Host 时链接使用转发的协议与域名
+  - 下载链接：完成的单文件任务生成链接后不带密钥可下载且内容一致；Range 请求返回 206；改动 sig 或 exp、过期返回 403；未完成或多文件返回 409；文件被删返回 404；expires_in 越界返回 400；带 X-Forwarded-Proto/Host 时链接使用转发的协议与域名；生成链接与 /dl 传输会刷新交付物最近使用时间
   - 删除任务：不存在返回 404；运行中删除返回 202；已结束删除返回 200；删除后按 ID 查询返回 404
   - 重试任务：失败/中断任务返回 202 且新任务在最前；已完成或运行中返回 409；不可重试返回 409；正在运行中删除返回 202
+  - 空间控制：任务总大小超限返回 task_too_large；磁盘腾空间后仍不足返回 disk_full；space-check 足够返回 200 与 free_bytes，不足返回 507 disk_full 且不创建任务

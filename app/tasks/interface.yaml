@@ -23,6 +23,21 @@ input:
   - name: max_downloads
     type: integer, optional
     desc: 转存完成后同时下载的任务上限；默认 2，设为 1 即逐个执行
+  - name: max_task_bytes
+    type: integer
+    desc: 单次任务分享文件总大小上限（字节，1000 进制）；必须 > 0；默认 10000000000（10GB）
+  - name: cleanup_interval
+    type: seconds, optional
+    desc: 定时维护清理间隔；默认 3600；设为 0 关闭定时维护（按任务腾空间仍执行）
+  - name: cleanup_min_age
+    type: seconds, optional
+    desc: 交付物闲置超过该秒数才可被清理；默认 604800（7 天）
+  - name: touch_download
+    type: path（下载目录内相对路径）
+    desc: 刷新该交付物的最近使用时间；路径不存在或越界时忽略
+  - name: check_space
+    type: integer（所需字节数）
+    desc: 按需清理冷交付物后检查下载目录是否有足够可用空间；足够返回当前可用字节，不足抛 DiskFull
 output:
   - name: task
     type: JSON {id, url, status, progress, speed?, downloaded?, total?, eta?, saved_to, pan_path?, result?, error?, created_at, finished_at?, alias_of?}
@@ -33,9 +48,15 @@ output:
 contract:
   - 链接取文字中第一个 pan.baidu.com/s/ 分享链接；提取码优先取链接中的 pwd 参数，否则取文字中的“提取码：xxxx”
   - 文字中没有分享链接时拒绝提交与预览，不创建任务
-  - 预览只调用 transfer list（只读），遇目录则用 --source-dir 递归列出子项并翻页直至 has_more 为假；合计全部文件 size 与 names；不创建任务、不写入 tasks_file、不占用转存与下载名额；链接失效、提取码错误等以 bdpan 错误原样返回
-  - 任务按提交顺序开始；开始后先查询分享信息（transfer list，只读，不占用转存与下载名额），随后按以下顺序短路，前一步命中则不再执行后续步骤
-  - 第一步 本地缓存（扫盘文件比对，不依赖任务历史）：单文件在 downloads/<大小>/<任务ID>/文件名 结构下找同名同大小文件；多文件扫描 downloads/<大小>/*.zip，只读 zip 中央目录，非目录成员的「文件名+大小」集合与分享中全部文件条目（不含目录）完全一致则命中；命中后直接完成并复用该路径，不再查询网盘、转存与下载；分享中无可比对的文件条目时跳过本步；空目录不参与复用
+  - 预览只调用 transfer list（只读），遇目录则用 --source-dir 递归列出子项并翻页直至 has_more 为假；合计全部文件 size 与 names；不创建任务、不写入 tasks_file、不占用转存与下载名额；链接失效、提取码错误等以 bdpan 错误原样返回；预览不因超限失败
+  - 任务按提交顺序开始；开始后先查询分享信息（transfer list，只读，不占用转存与下载名额）；若分享文件总大小（不含目录）大于 max_task_bytes，任务失败，error.code 为 task_too_large，不转存、不下载
+  - 随后按以下顺序短路，前一步命中则不再执行后续步骤
+  - 第一步 本地缓存（扫盘文件比对，不依赖任务历史）：单文件在 downloads/<大小>/<任务ID>/文件名 结构下找同名同大小文件；多文件扫描 downloads/<大小>/*.zip，只读 zip 中央目录，非目录成员的「文件名+大小」集合与分享中全部文件条目（不含目录）完全一致则命中；命中后直接完成并复用该路径，刷新该交付物最近使用时间，不再查询网盘、转存与下载；分享中无可比对的文件条目时跳过本步；空目录不参与复用
+  - 本地缓存未命中、即将占用本地下载空间前：若下载目录可用空间小于本任务所需字节数，则按最近使用时间从旧到新删除闲置超过 cleanup_min_age 的交付物，直到空间足够或无可删项；清理后仍不足则任务失败，error.code 为 disk_full，不开始下载；缓存命中不走本步
+  - check_space(need) 供调用方在创建计费任务前预检：逻辑与上条腾空间相同，不足抛 DiskFull
+  - cleanup_interval > 0 时按该间隔定时维护：删除闲置超过 cleanup_min_age 的交付物；并清理空目录，以及目录内全部文件均已闲置超过 cleanup_min_age、且无运行中任务占用的残留工作目录（以文件 mtime 为准，不用目录 mtime）；cleanup_interval 为 0 时不做定时维护
+  - 交付物完成写入后刷新其最近使用时间；调用方可通过 touch_download(相对路径) 在生成下载链接或 /dl 传输时刷新同一交付物的最近使用时间
+  - 最近使用时间用交付物文件的 mtime 表示（显式更新）；清理只删磁盘交付物，不删任务历史
   - 第二步 云盘去重：在自己网盘 /apps/bdpan/ 下按同名同大小查找；单文件命中则免转存；多文件须分享中全部文件（不含目录）均命中才免转存，否则整包转存；免转存时直接从命中路径下载；需要转存时转存阶段全局串行（同一百度账号同时只允许一个转存）
   - 转存目标为相对路径「整理/YYYYMM/6 位十六进制随机」（即 我的应用数据/bdpan/整理/<月份>/<随机>/）；通过 bdpan transfer -d 指定；不含 task_id
   - 转存时 bdpan 返回“已提交”则任务为 submitted，持转存锁按 transfer_poll_interval 轮询等待，不占用下载并发名额；transfer_timeout 内未出现全部转存结果时失败
@@ -73,6 +94,10 @@ errors:
     desc: 任务失败原因：服务重启时任务尚未完成
   - code: transfer_timeout
     desc: 任务失败原因：转存已提交，但在 transfer_timeout 内未在网盘中找到全部转存结果
+  - code: task_too_large
+    desc: 任务失败原因：分享文件总大小超过 max_task_bytes
+  - code: disk_full
+    desc: 任务失败原因：下载前腾空间后可用空间仍不足本任务所需
 tests:
   - 分享文字识别：链接带 pwd、文字中单独写提取码、两者都有、无提取码、无链接
   - 预览：无链接拒绝且不调用 bdpan；有链接时 transfer list 递归展开目录（--source-dir）后返回全部文件大小合计与文件名列表，不创建任务、不写 tasks_file；链接失效等错误原样返回且不创建任务
@@ -101,3 +126,6 @@ tests:
 
   - 删除任务后按 ID 查询返回 404；删除运行中的任务时先取消该任务
   - 重试失败/中断任务返回新任务对象，新任务出现在列表最前面
+  - 超限：分享总大小大于 max_task_bytes 时任务 failed，error.code 为 task_too_large，不转存不下载；预览仍返回真实 total_bytes
+  - 腾空间：下载前可用空间不足时先删最久未用且闲置超过 cleanup_min_age 的交付物；清后足够则继续下载；仍不足则 failed，error.code 为 disk_full
+  - 使用时间：本地缓存命中、完成写入、touch_download 均刷新交付物 mtime；定时维护与腾空间只清理闲置超过 cleanup_min_age 的交付物，并清掉空父目录与无运行中任务的残留工作目录
