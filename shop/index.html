@@ -19,7 +19,7 @@
   .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
   .row input { flex: 1; min-width: 200px; }
   .msg { font-size: 14px; min-height: 20px; margin-top: 8px; }
-  .ok { color: #16a34a; } .err { color: #dc2626; } .warn { color: #d97706; }
+  .ok { color: #16a34a; } .err { color: #dc2626; } .warn { color: #d97706; } .info { color: #2563eb; }
   .top { display: flex; justify-content: space-between; gap: 10px; }
   .title { font-weight: 600; word-break: break-all; }
   .tag { font-size: 12px; padding: 2px 10px; border-radius: 999px; background: #eef2f7; white-space: nowrap; height: fit-content; }
@@ -167,6 +167,7 @@ function renderTask(t) {
   const mine = history().find(h => h.page === location.pathname);
   if (mine && mine.remaining != null) html += `<div class="meta">本次提交后卡密剩余 ${esc(mine.remaining)} 次</div>`;
   if (ACTIVE.includes(t.status)) html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
+  if (ACTIVE.includes(t.status)) html += `<div class="msg info">请耐心等待，文件下载完成后才会生成下载链接。</div>`;
   if (meta.length) html += `<div class="meta">${meta.map(m => `<span>${esc(m)}</span>`).join("")}</div>`;
   if (t.status === "failed" && t.error) html += `<div class="msg err">失败原因：${esc(t.error.hint || t.error.message)}</div>`;
   if (t.status === "failed") {

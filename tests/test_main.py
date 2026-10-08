@@ -86,13 +86,13 @@ def _combined_flow(client, work, downloads):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         task = client.get(f"/api/tasks/{task_id}", headers=AUTH).json()["data"]
-        if task["status"] not in ("queued", "running"):
+        if task["status"] not in ("queued", "running", "submitted"):
             break
         time.sleep(0.05)
     assert task["status"] == "done", task
-    assert task["progress"] == 100 and task["saved_to"] == "shared.bin"
+    assert task["progress"] == 100 and task["saved_to"] == f"{len(b'shared-content')}/shared.bin"
     assert task["pan_path"] == "我的应用数据/bdpan/2026-10-03/shared.bin"
-    assert (downloads / "shared.bin").read_bytes() == b"shared-content"
+    assert (downloads / str(len(b"shared-content")) / "shared.bin").read_bytes() == b"shared-content"
 
     res = client.post(f"/api/tasks/{task_id}/link", headers=AUTH)
     assert res.status_code == 200

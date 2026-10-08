@@ -12,6 +12,15 @@ import time
 from pathlib import Path
 
 VALID_CODE = "a" * 32
+SHARE_CONTENT = b"shared-content"
+
+
+def share_name() -> str:
+    return os.environ.get("FAKE_SHARE_NAME", "shared.bin")
+
+
+def share_items() -> list[dict]:
+    return [{"name": share_name(), "size": len(SHARE_CONTENT), "is_dir": False}]
 
 
 def envelope(data=None, error=""):
@@ -26,6 +35,12 @@ def entry(store: Path, p: Path) -> dict:
         "size": 0 if p.is_dir() else p.stat().st_size,
         "isdir": p.is_dir(),
     }
+
+
+def _in_store(store: Path, remote: str) -> Path:
+    if remote.startswith("/apps/bdpan/"):
+        remote = remote[len("/apps/bdpan/"):]
+    return store / remote
 
 
 def stateful(argv: list[str], stdin: str) -> object:
@@ -52,12 +67,21 @@ def stateful(argv: list[str], stdin: str) -> object:
         return envelope(error="请先执行 bdpan login 命令")
 
     if command == "ls":
-        target = store / pos[0] if pos else store
+        target = _in_store(store, pos[0]) if pos else store
         if not target.exists():
             return envelope(error="找不到指定的文件或目录（错误码 -9），请检查路径是否正确。")
         if target.is_file():
             return [entry(store, target)]
         return [entry(store, p) for p in sorted(target.iterdir())]
+    if command == "transfer":
+        # transfer list：查询分享内容；transfer：把分享转存到 /apps/bdpan/<日期>/
+        if "list" in rest:
+            return {"items": share_items()}
+        name = share_name()
+        date_dir = store / "2026-10-03"
+        date_dir.mkdir(parents=True, exist_ok=True)
+        (date_dir / name).write_bytes(SHARE_CONTENT)
+        return {"target_dir": "我的应用数据/bdpan/2026-10-03"}
     if command == "mkdir":
         (store / pos[0]).mkdir(parents=True, exist_ok=True)
         return {"status": "ok", "path": pos[0]}
@@ -84,15 +108,28 @@ def stateful(argv: list[str], stdin: str) -> object:
         })
     if command == "download":
         remote, local = pos
-        src = store / remote
+        src = _in_store(store, remote)
         if not src.exists():
             return envelope(error="找不到指定的文件或目录（错误码 -9），请检查路径是否正确。")
         print("下载中 100% |████| (1/1 B)\r", file=sys.stderr)
         if src.is_dir():
             shutil.copytree(src, local)
-        else:
-            shutil.copyfile(src, local)
-        return envelope({"remote": remote, "local": local})
+            return envelope({"remote": remote, "local": local})
+        local_path = Path(local)
+        if local_path.is_dir() or local.endswith(("/", os.sep)):
+            local_path.mkdir(parents=True, exist_ok=True)
+            local_path = local_path / src.name
+        shutil.copyfile(src, local_path)
+        return envelope({
+            "remote": "/" + remote,
+            "local": str(local_path.parent) + "/",
+            "items": [{
+                "name": src.name,
+                "size": src.stat().st_size,
+                "saved_path": ("我的应用数据/" + remote[len("/apps/"):])
+                    if remote.startswith("/apps/") else "我的应用数据/bdpan/" + remote,
+            }],
+        })
     if command == "rm":
         for p in pos:
             target = store / p

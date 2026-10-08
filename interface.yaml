@@ -30,6 +30,9 @@ input:
   - name: BAIDU_EASY_TASKS_FILE
     type: env string
     desc: 分享下载任务历史文件；默认 tasks.json，镜像内为 /data/tasks.json
+  - name: BAIDU_EASY_MAX_DOWNLOADS
+    type: env integer
+    desc: 转存完成后同时下载的任务上限；默认 2，设为 1 即逐个执行
   - name: TMPDIR
     type: env string
     desc: 上传、下载临时文件目录；默认系统临时目录
