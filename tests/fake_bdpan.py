@@ -74,14 +74,17 @@ def stateful(argv: list[str], stdin: str) -> object:
             return [entry(store, target)]
         return [entry(store, p) for p in sorted(target.iterdir())]
     if command == "transfer":
-        # transfer list：查询分享内容；transfer：把分享转存到 /apps/bdpan/<日期>/
+        # transfer list：查询分享内容；transfer：把分享转存到 -d 指定目录（默认 日期/）
         if "list" in rest:
             return {"items": share_items()}
         name = share_name()
-        date_dir = store / "2026-10-03"
-        date_dir.mkdir(parents=True, exist_ok=True)
-        (date_dir / name).write_bytes(SHARE_CONTENT)
-        return {"target_dir": "我的应用数据/bdpan/2026-10-03"}
+        dest_rel = "2026-10-03"
+        if "-d" in flags:
+            dest_rel = flags[flags.index("-d") + 1].strip("/")
+        dest_dir = store / dest_rel
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / name).write_bytes(SHARE_CONTENT)
+        return {"target_dir": "我的应用数据/bdpan/" + dest_rel}
     if command == "mkdir":
         (store / pos[0]).mkdir(parents=True, exist_ok=True)
         return {"status": "ok", "path": pos[0]}

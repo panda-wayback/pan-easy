@@ -182,16 +182,47 @@ class TaskQueue:
         return self._add(url, pwd)
 
     async def preview(self, text: str) -> dict[str, Any]:
-        """只读查询分享文件总大小，不创建任务、不转存、不下载。"""
+        """只读查询分享文件总大小与文件名（递归展开目录），不创建任务、不转存、不下载。"""
         url, pwd = parse_share(text)
+        files = await self._list_share_files(url, pwd)
+        total = sum(size for it in files if isinstance((size := it.get("size")), int))
+        names = [name for it in files if isinstance((name := it.get("name")), str) and name]
+        return {"total_bytes": total, "names": names}
+
+    async def _transfer_list_page(
+        self, url: str, flags: list[str], source_dir: Optional[str] = None, page: int = 1
+    ) -> dict[str, Any]:
+        page_flags = list(flags)
+        if source_dir:
+            page_flags += ["--source-dir", source_dir]
+        if page > 1:
+            page_flags += ["--page", str(page)]
+        data = await self.bdpan.run_subcommand("transfer", "list", [url], page_flags)
+        return data if isinstance(data, dict) else {}
+
+    async def _list_share_files(self, url: str, pwd: Optional[str]) -> list[dict[str, Any]]:
+        """transfer list 递归展开目录，返回全部文件条目（不含目录）。"""
         flags = ["-p", pwd] if pwd else []
-        data = await self.bdpan.run_subcommand("transfer", "list", [url], flags)
-        items = [it for it in (data or {}).get("items") or [] if isinstance(it, dict)]
-        total = sum(
-            size for it in items
-            if not it.get("is_dir") and isinstance((size := it.get("size")), int)
-        )
-        return {"total_bytes": total}
+        files: list[dict[str, Any]] = []
+
+        async def walk(source_dir: Optional[str]) -> None:
+            page = 1
+            while True:
+                data = await self._transfer_list_page(url, flags, source_dir, page)
+                items = [it for it in data.get("items") or [] if isinstance(it, dict)]
+                for it in items:
+                    if it.get("is_dir"):
+                        path = it.get("path")
+                        if isinstance(path, str) and path.strip():
+                            await walk(path)
+                        continue
+                    files.append(it)
+                if not data.get("has_more"):
+                    break
+                page += 1
+
+        await walk(None)
+        return files
 
     def list(self) -> list[dict[str, Any]]:
         return [self._view(t) for t in reversed(self._tasks.values())]
@@ -328,25 +359,16 @@ class TaskQueue:
         if not items:
             raise ValueError("分享链接无效或已失效")
         task["_items"] = items
-        single_file = len(items) == 1 and not items[0].get("is_dir")
 
-        # 第一步：本地缓存
-        if single_file:
-            cached = self._cached_local(items[0])
-            if cached:
-                self._finish_local(task, items[0], cached)
-                return
+        # 第一步：本地缓存（单文件与多文件 zip 均复用已有 downloads）
+        cached = self._reuse_local(task, items)
+        if cached and self._finish_local(task, items, cached):
+            return
 
-        # 第二步：云盘去重（仅单文件）
-        netdisk_path = None
-        if self.enable_smart_download and single_file:
-            netdisk_path = await self._find_in_netdisk(items[0])
+        # 第二步：云盘去重（单文件命中即免；多文件须全部命中；含目录则跳过）
+        paths = await self._dedup_netdisk(items) if self.enable_smart_download else None
 
-        target = os.path.join(self._target_dir(items), "")
-        os.makedirs(target, exist_ok=True)
-
-        if netdisk_path is not None:
-            paths = [f"/apps/bdpan/{netdisk_path}"]
+        if paths is not None:
             # 免转存：下载前判定合并
             if await self._alias_if_overlap(task, items):
                 return
@@ -367,32 +389,136 @@ class TaskQueue:
             if paths is None:
                 return
 
-        # 下载阶段：占用并发名额
+        # 目录条目展开为文件后再定工作目录，避免 size_key=0、把目录路径当文件打包
+        items, paths = await self._expand_dir_items(items, paths)
+        task["_items"] = items
+
+        # 下载阶段：占用并发名额；工作目录延后到此处创建，避免合并/失败留下空目录
         async with self._download_slots:
             # 获取名额后可能已有相同任务先开始下载，再判定一次
             if await self._alias_if_overlap(task, items):
                 return
-            await self._download(task, items, paths, target)
+            target_dir = self._target_dir(task, items)
+            self._prepare_target_dir(target_dir)
+            try:
+                await self._download(task, items, paths, target_dir)
+            except Exception:
+                self._cleanup_empty_dir(target_dir)
+                raise
 
     # ---- 第一步 本地缓存 --------------------------------------------
 
-    def _cached_local(self, item: dict[str, Any]) -> Optional[str]:
-        name, size = item.get("name"), item.get("size")
-        if not name or size is None:
+    @staticmethod
+    def _file_entries(items: list[dict[str, Any]]) -> list[tuple[str, int]]:
+        """分享中的文件条目（不含目录）：(文件名, 大小)。"""
+        out = []
+        for it in items:
+            name, size = it.get("name"), it.get("size")
+            if it.get("is_dir") or not name or not isinstance(size, int):
+                continue
+            out.append((name, size))
+        return out
+
+    @staticmethod
+    def _zip_members(path: str) -> Optional[set[tuple[str, int]]]:
+        """读 zip 中央目录，返回非目录成员的 (文件名, 大小)；坏包返回 None。"""
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                members: set[tuple[str, int]] = set()
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    name = info.filename.rstrip("/").rsplit("/", 1)[-1]
+                    members.add((name, info.file_size))
+                return members
+        except (OSError, zipfile.BadZipFile):
             return None
-        rel = os.path.join(str(size), name)
-        path = os.path.join(self.download_dir, rel)
-        if os.path.isfile(path) and os.path.getsize(path) == size:
-            return rel
+
+    def _zip_matches_items(self, path: str, items: list[dict[str, Any]]) -> bool:
+        """路径必须是真实 zip 文件，且中央目录成员名+大小与分享文件条目完全一致。"""
+        if not path or not os.path.isfile(path) or not path.endswith(".zip"):
+            return False
+        files = self._file_entries(items)
+        expected = set(files)
+        if not files or len(expected) != len(files):
+            return False
+        members = self._zip_members(path)
+        return members is not None and members == expected
+
+    def _reuse_local(self, task: dict[str, Any], items: list[dict[str, Any]]) -> Optional[str]:
+        """扫盘文件比对复用：单文件同名同大小；多文件只认校验通过的 zip（不认目录）。"""
+        files = self._file_entries(items)
+        if not files:
+            return None
+        expected = set(files)
+        if len(expected) != len(files):
+            return None  # 同名同大小重复条目无法用集合可靠比对
+
+        need_archive = len(items) > 1 or bool(items[0].get("is_dir"))
+
+        # 单文件：只在 downloads/<该文件大小>/<任务ID>/文件名 下找，避免误命中其它包的工作目录散文件
+        if not need_archive:
+            name, size = files[0]
+            size_path = os.path.join(self.download_dir, str(size))
+            if not os.path.isdir(size_path):
+                return None
+            try:
+                task_dirs = os.listdir(size_path)
+            except OSError:
+                return None
+            for task_dir in task_dirs:
+                task_path = os.path.join(size_path, task_dir)
+                if not os.path.isdir(task_path):
+                    continue
+                candidate = os.path.join(task_path, name)
+                if os.path.isfile(candidate) and os.path.getsize(candidate) == size:
+                    return os.path.join(str(size), task_dir, name)
+            return None
+
+        # 多文件：只扫 *.zip，读中央目录比对；跳过一切目录（含空目录）
+        try:
+            size_dirs = os.listdir(self.download_dir)
+        except OSError:
+            return None
+        pack_key = self._size_key(items)
+        ordered = [pack_key] + [d for d in size_dirs if d != pack_key]
+        for size_dir in ordered:
+            size_path = os.path.join(self.download_dir, size_dir)
+            if not os.path.isdir(size_path):
+                continue
+            try:
+                names = os.listdir(size_path)
+            except OSError:
+                continue
+            for entry in names:
+                if not entry.endswith(".zip"):
+                    continue
+                path = os.path.join(size_path, entry)
+                if self._zip_matches_items(path, items):
+                    return os.path.join(size_dir, entry)
         return None
 
-    def _finish_local(self, task: dict[str, Any], item: dict[str, Any], rel: str) -> None:
-        task.update(status="done", progress=100, saved_to=rel, total=item["size"],
-                    downloaded=item["size"], speed=None, eta=None, finished_at=_now())
+    def _finish_local(self, task: dict[str, Any], items: list[dict[str, Any]], rel: str) -> bool:
+        """确认交付物有效后标记完成。多文件必须是成员校验通过的 zip；目录一律拒绝。返回是否命中。"""
+        need_archive = len(items) > 1 or bool(items and items[0].get("is_dir"))
+        abs_path = os.path.join(self.download_dir, rel)
+        if need_archive:
+            if not self._zip_matches_items(abs_path, items):
+                log.warning("本地复用未通过 zip 内部校验，忽略 rel=%s", rel)
+                return False
+        elif not os.path.isfile(abs_path):
+            log.warning("本地复用路径不是文件，忽略 rel=%s", rel)
+            return False
+        total = sum(i["size"] for i in items if isinstance(i.get("size"), int) and not i.get("is_dir"))
+        task.update(status="done", progress=100, saved_to=rel, total=total or None,
+                    downloaded=total or None, speed=None, eta=None, finished_at=_now())
         task["error"] = {"code": "local_exists", "message": "文件已在本地下载目录", "errno": None,
                          "hint": f"跳过下载：downloads/{rel}"}
         self._save()
         log.info("任务完成（本地缓存命中） task=%s saved_to=%s", task["id"], rel)
+        return True
 
     # ---- 分享信息 ---------------------------------------------------
 
@@ -401,14 +527,46 @@ class TaskQueue:
         data = await self.bdpan.run_subcommand("transfer", "list", [task["url"]], flags)
         return [it for it in (data or {}).get("items") or [] if isinstance(it, dict)]
 
-    def _target_dir(self, items: list[dict[str, Any]]) -> str:
-        if len(items) == 1 and not items[0].get("is_dir"):
-            size = items[0].get("size")
-            return os.path.join(self.download_dir, str(size)) if size is not None else self.download_dir
-        if len(items) > 1:
-            total = sum(i.get("size", 0) for i in items if not i.get("is_dir"))
-            return os.path.join(self.download_dir, str(total) if total else "multi")
-        return os.path.join(self.download_dir, "folder")
+    @staticmethod
+    def _size_key(items: list[dict[str, Any]]) -> str:
+        total = sum(s for _, s in TaskQueue._file_entries(items))
+        return str(total)
+
+    def _target_dir(self, task: dict[str, Any], items: list[dict[str, Any]]) -> str:
+        return os.path.join(self.download_dir, self._size_key(items), task["id"])
+
+    def _prepare_target_dir(self, target_dir: str) -> None:
+        """下载前准备工作目录：空则删掉重建，有残留则清空，避免空目录/脏目录干扰。"""
+        import shutil
+
+        if os.path.isdir(target_dir):
+            try:
+                contents = os.listdir(target_dir)
+            except OSError:
+                contents = ["?"]
+            if contents:
+                log.info("清理残留工作目录 dir=%s files=%s", target_dir, len(contents))
+                shutil.rmtree(target_dir, ignore_errors=True)
+            else:
+                try:
+                    os.rmdir(target_dir)
+                except OSError:
+                    shutil.rmtree(target_dir, ignore_errors=True)
+        os.makedirs(target_dir, exist_ok=True)
+
+    def _cleanup_empty_dir(self, target_dir: str) -> None:
+        """失败时删掉空工作目录，并尽量去掉空的大小父目录。"""
+        try:
+            if os.path.isdir(target_dir) and not os.listdir(target_dir):
+                os.rmdir(target_dir)
+        except OSError:
+            return
+        parent = os.path.dirname(target_dir)
+        try:
+            if parent.startswith(self.download_dir) and os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
+        except OSError:
+            pass
 
     # ---- 第二步 云盘去重 --------------------------------------------
 
@@ -425,6 +583,24 @@ class TaskQueue:
                     and str(found.get("path", "")).startswith("/apps/bdpan/")):
                 return found["path"][len("/apps/bdpan/"):]
         return None
+
+    async def _dedup_netdisk(self, items: list[dict[str, Any]]) -> Optional[list[str]]:
+        """在 /apps/bdpan/ 下按同名同大小去重；全部命中才返回绝对路径列表。"""
+        if not items or any(it.get("is_dir") for it in items):
+            return None
+        paths = []
+        for item in items:
+            rel = await self._find_in_netdisk(item)
+            if rel is None:
+                return None
+            paths.append(f"/apps/bdpan/{rel}")
+        return paths
+
+    @staticmethod
+    def _pan_transfer_dir(_task: Optional[dict[str, Any]] = None) -> str:
+        """转存相对路径：整理/<YYYYMM>/<6 位随机>，外观中性、按月可清理。"""
+        month = datetime.now().astimezone().strftime("%Y%m")
+        return f"整理/{month}/{uuid.uuid4().hex[:6]}"
 
     async def _find_anywhere(self, item: dict[str, Any]) -> Optional[str]:
         """在整个网盘按同名同大小查找，返回绝对路径。"""
@@ -454,15 +630,69 @@ class TaskQueue:
             paths.append(path)
         return paths
 
+    async def _list_files_under(self, pan_path: str) -> list[dict[str, Any]]:
+        """递归列出网盘目录下的全部文件：[{name, size, path, is_dir: False}, ...]。"""
+        try:
+            entries = _entries(await self.bdpan.run("ls", [pan_path], []))
+        except BdpanError as err:
+            if err.kind in _AUTH_ERRORS:
+                raise
+            return []
+        out: list[dict[str, Any]] = []
+        for entry in entries:
+            path = entry.get("path")
+            if not isinstance(path, str):
+                continue
+            if _entry_isdir(entry):
+                out.extend(await self._list_files_under(path))
+                continue
+            name = _entry_name(entry)
+            size = entry.get("size")
+            if not name or not isinstance(size, int):
+                continue
+            out.append({"name": name, "size": size, "path": path, "is_dir": False})
+        return out
+
+    async def _expand_dir_items(
+        self, items: list[dict[str, Any]], paths: list[str]
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """目录条目递归展开为文件；无目录时原样返回。展开后为空则报错。"""
+        if not items or not any(it.get("is_dir") for it in items):
+            return items, paths
+        if len(paths) < len(items):
+            raise BdpanError("bdpan_error", "转存结果路径与分享条目数量不一致", None)
+        new_items: list[dict[str, Any]] = []
+        new_paths: list[str] = []
+        for i, item in enumerate(items):
+            path = paths[i]
+            if not item.get("is_dir"):
+                new_items.append(item)
+                new_paths.append(path)
+                continue
+            files = await self._list_files_under(path)
+            if not files:
+                raise BdpanError(
+                    "bdpan_error",
+                    f"转存目录为空或无法列出文件：{item.get('name') or path}",
+                    None,
+                )
+            for f in files:
+                new_items.append({"name": f["name"], "size": f["size"], "is_dir": False})
+                new_paths.append(f["path"])
+        log.info("目录展开为 %s 个文件", len(new_items))
+        return new_items, new_paths
+
     # ---- 转存（全局串行） -------------------------------------------
 
     async def _transfer(self, task: dict[str, Any], items: list[dict[str, Any]]) -> Optional[list[str]]:
+        pan_dir = self._pan_transfer_dir(task)
         flags = ["-p", task["pwd"]] if task.get("pwd") else []
+        flags += ["-d", pan_dir]
         async with self._transfer_lock:
             # 等到锁时源任务可能已完成转存，锁内再判定一次以免重复转存
             if await self._alias_if_overlap(task, items):
                 return None
-            log.info("开始转存 task=%s", task["id"])
+            log.info("开始转存 task=%s dir=%s", task["id"], pan_dir)
             result = await self.bdpan.run("transfer", [task["url"]], flags)
             if isinstance(result, dict) and result.get("status") == "submitted":
                 task["status"] = "submitted"
@@ -539,10 +769,14 @@ class TaskQueue:
             task_id = nxt
 
     async def _alias_if_overlap(self, task: dict[str, Any], items: list[dict[str, Any]]) -> bool:
+        """只与进行中的任务合并；已完成的文件复用只走本地缓存，不看历史 done。"""
         sig = self._signature(items)
         url = self._norm_url(task["url"])
         for other_id, other in self._tasks.items():
-            if (other_id == task["id"] or other["status"] == "failed" or other.get("alias_of")
+            # 只合并 queued / running / submitted；done / failed 一律跳过
+            if (other_id == task["id"]
+                    or other["status"] not in ("queued", "running", "submitted")
+                    or other.get("alias_of")
                     or other.get("_seq", 0) >= task.get("_seq", 0)):
                 continue
             overlap = self._norm_url(other["url"]) == url
@@ -558,80 +792,196 @@ class TaskQueue:
 
     # ---- 下载 -------------------------------------------------------
 
+    def _local_dest(self, target_dir: str, item: dict[str, Any]) -> str:
+        """单文件为「目录/文件名」；目录条目仍用目录路径（尾加分隔符）。"""
+        name = item.get("name")
+        if name and not item.get("is_dir"):
+            return os.path.join(target_dir, name)
+        return os.path.join(target_dir, "")
+
     async def _download(self, task: dict[str, Any], items: list[dict[str, Any]],
-                        paths: list[str], target: str) -> None:
+                        paths: list[str], target_dir: str) -> None:
+        # 整包 total：分享文件条目 size 之和（多文件进度不被单文件覆盖）
+        size_by_index = [
+            it["size"] if (not it.get("is_dir") and isinstance(it.get("size"), int)) else 0
+            for it in items
+        ]
+        pack_total = sum(size_by_index)
+        if pack_total:
+            task["total"] = pack_total
+            task["downloaded"] = 0
+
+        completed = 0  # 已完整下完的文件字节合计
         tail = ""
         last_milestone = 0
 
-        def on_output(text: str) -> None:
-            nonlocal tail, last_milestone
-            text = tail + text
-            for match in _PERCENT_RE.finditer(text):
-                value = min(int(match.group(1)), 99)
-                if value > task["progress"]:
-                    task["progress"] = value
-            stats = None
-            for stats in _STATS_RE.finditer(text):
-                pass
-            if stats:
-                dl_unit = stats.group(2) or stats.group(4)
-                task["downloaded"] = _bytes(stats.group(1), dl_unit)
-                task["total"] = _bytes(stats.group(3), stats.group(4))
-                task["speed"] = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
-                task["eta"] = _seconds(stats.group(8))
-            milestone = task["progress"] // 10 * 10
-            if milestone > last_milestone:
-                last_milestone = milestone
-                log.info("下载进度 task=%s progress=%s%%", task["id"], milestone)
-            tail = re.split(r"[\r\n]", text)[-1][-512:]
-            if stats:
-                self._save()
+        def make_on_output(base: int):
+            def on_output(text: str) -> None:
+                nonlocal tail, last_milestone
+                text = tail + text
+                stats = None
+                for stats in _STATS_RE.finditer(text):
+                    pass
+                if stats:
+                    dl_unit = stats.group(2) or stats.group(4)
+                    cur_dl = _bytes(stats.group(1), dl_unit)
+                    task["downloaded"] = base + cur_dl
+                    if pack_total:
+                        task["total"] = pack_total
+                    else:
+                        task["total"] = base + _bytes(stats.group(3), stats.group(4))
+                    speed = _bytes(stats.group(5), stats.group(6)) if stats.group(5) else None
+                    task["speed"] = speed
+                    remain = (task["total"] or 0) - (task["downloaded"] or 0)
+                    if speed and speed > 0 and remain > 0:
+                        task["eta"] = round(remain / speed)
+                    elif remain <= 0:
+                        task["eta"] = 0
+                    else:
+                        task["eta"] = _seconds(stats.group(8))
+                if pack_total and task.get("downloaded") is not None:
+                    value = min(99, int(task["downloaded"] * 100 / pack_total))
+                    if value > task["progress"]:
+                        task["progress"] = value
+                else:
+                    for match in _PERCENT_RE.finditer(text):
+                        value = min(int(match.group(1)), 99)
+                        if value > task["progress"]:
+                            task["progress"] = value
+                milestone = task["progress"] // 10 * 10
+                if milestone > last_milestone:
+                    last_milestone = milestone
+                    log.info("下载进度 task=%s progress=%s%%", task["id"], milestone)
+                tail = re.split(r"[\r\n]", text)[-1][-512:]
+                # 进度只更新内存，不写 tasks_file（避免刷盘拖死事件循环）
+            return on_output
 
         need_archive = len(items) > 1 or items[0].get("is_dir")
         results = []
-        for path in paths:
-            results.append(await self.bdpan.run("download", [path, target], [], on_output=on_output))
-        data = results[0] if len(results) == 1 else {
-            "local": target,
-            "saved_path": next((r.get("target_dir") or r.get("saved_path") for r in results
-                                if isinstance(r, dict) and (r.get("target_dir") or r.get("saved_path"))), None),
-            "items": [it for r in results if isinstance(r, dict) for it in r.get("items") or []],
-        }
+        dests = []
+        for i, path in enumerate(paths):
+            item = items[i] if i < len(items) else {}
+            dest = self._local_dest(target_dir, item)
+            dests.append(dest)
+            results.append(await self.bdpan.run(
+                "download", [path, dest], [], on_output=make_on_output(completed)))
+            # 每个文件下完后校验本地确有文件，避免空目录冒充完成
+            expect = size_by_index[i] if i < len(size_by_index) else 0
+            if item.get("name") and not item.get("is_dir"):
+                if not os.path.isfile(dest):
+                    raise BdpanError("bdpan_error", f"下载结束但本地文件不存在：{item.get('name')}", None)
+                actual = os.path.getsize(dest)
+                if expect and actual != expect:
+                    raise BdpanError(
+                        "bdpan_error",
+                        f"下载文件大小不符：{item.get('name')} 期望 {expect} 实际 {actual}",
+                        None,
+                    )
+            done_size = expect if expect else (os.path.getsize(dest) if os.path.isfile(dest) else 0)
+            completed += done_size
+            task["downloaded"] = completed
+            if pack_total:
+                task["total"] = pack_total
+        if len(results) == 1:
+            data = results[0] if isinstance(results[0], dict) else {}
+            # 显式文件路径时，以我们传入的 dest 为准，避免 bdpan 只返回目录导致二次拼接错误
+            if dests and not need_archive:
+                data = {**data, "local": dests[0]}
+        else:
+            data = {
+                "local": target_dir,
+                "saved_path": next((r.get("target_dir") or r.get("saved_path") for r in results
+                                    if isinstance(r, dict) and (r.get("target_dir") or r.get("saved_path"))), None),
+                "items": [it for r in results if isinstance(r, dict) for it in r.get("items") or []],
+            }
         task["result"] = data
-        task["status"] = "done"
-        task["progress"] = 100
-        self._fill_result(task, data if isinstance(data, dict) else {})
+        # 完成态以分享条目 size 为准（多文件 bdpan 结果常缺 size，避免残留单文件进度）
+        entries = self._file_entries(items)
+        if entries:
+            total = sum(s for _, s in entries)
+            task["total"] = task["downloaded"] = total
 
         if need_archive:
-            await self._archive(task, items, target)
+            # 多文件：先填 pan_path，saved_to 只能在 zip 成员校验通过后由 _archive 写入（绝不能是目录）
+            task["pan_path"] = data.get("saved_path")
+            await self._archive(task, items, target_dir, dests)
+            zip_abs = os.path.join(self.download_dir, task.get("saved_to") or "")
+            if not self._zip_matches_items(zip_abs, items):
+                raise BdpanError("bdpan_error", "打包后 zip 内部文件与分享条目不一致", None)
+        else:
+            self._fill_result(task, data if isinstance(data, dict) else {})
+            if entries:
+                task["total"] = task["downloaded"] = total
 
+        task["status"] = "done"
+        task["progress"] = 100
         task["speed"] = None
         task["eta"] = None
         task["finished_at"] = _now()
         self._save()
         log.info("任务完成 task=%s saved_to=%s", task["id"], task.get("saved_to"))
 
-    async def _archive(self, task: dict[str, Any], items: list[dict[str, Any]], target_dir: str) -> None:
-        import glob
-        import shutil
+    async def _archive(
+        self,
+        task: dict[str, Any],
+        items: list[dict[str, Any]],
+        target_dir: str,
+        file_paths: list[str],
+    ) -> None:
+        """打成 downloads/<总大小>/<task_id>.zip，读中央目录校验成员后才写入 saved_to。"""
+        import zipfile
 
-        downloaded = glob.glob(os.path.join(target_dir, "*"))
-        if not downloaded:
-            return
-        if len(items) > 1:
-            archive_name = f"multiple_files_{len(items)}"
-        else:
-            archive_name = items[0].get("name", "folder")
+        files = [p for p in file_paths if isinstance(p, str) and os.path.isfile(p)]
+        if not files:
+            self._cleanup_empty_dir(target_dir)
+            raise BdpanError("bdpan_error", "下载完成但本地没有可打包的文件", None)
+        size_key = self._size_key(items)
+        zip_name = f"{task['id']}.zip"
+        size_dir = os.path.join(self.download_dir, size_key)
+        os.makedirs(size_dir, exist_ok=True)
+        final_zip = os.path.join(size_dir, zip_name)
+        rel = os.path.join(size_key, zip_name)
+
+        def _build() -> None:
+            with tempfile.TemporaryDirectory(dir=self.download_dir, prefix=".archive-") as tmp:
+                staging_zip = os.path.join(tmp, zip_name)
+                used_names: set[str] = set()
+                with zipfile.ZipFile(staging_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for path in files:
+                        base = os.path.basename(path)
+                        name = base
+                        n = 1
+                        while name in used_names:
+                            stem, ext = os.path.splitext(base)
+                            name = f"{stem}_{n}{ext}"
+                            n += 1
+                        used_names.add(name)
+                        zf.write(path, arcname=name)
+                os.replace(staging_zip, final_zip)
+            for path in files:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(target_dir)
+            except OSError:
+                pass
+
         try:
-            shutil.make_archive(os.path.join(target_dir, archive_name), "zip", target_dir)
-            for item_path in downloaded:
-                if os.path.isfile(item_path):
-                    os.remove(item_path)
-                elif os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
-            task["saved_to"] = os.path.join(os.path.basename(target_dir), f"{archive_name}.zip")
+            await asyncio.to_thread(_build)
         except Exception as e:
-            log.warning("打包失败 task=%s err=%s", task["id"], e)
+            self._cleanup_empty_dir(target_dir)
+            raise BdpanError("bdpan_error", f"打包失败：{e}", None) from e
+
+        if not self._zip_matches_items(final_zip, items):
+            try:
+                os.remove(final_zip)
+            except OSError:
+                pass
+            self._cleanup_empty_dir(target_dir)
+            raise BdpanError("bdpan_error", "打包后 zip 内部文件与分享条目不一致", None)
+        task["saved_to"] = rel
 
     # ---- 视图与结果填充 ---------------------------------------------
 
@@ -651,7 +1001,10 @@ class TaskQueue:
         single = items[0] if len(items) == 1 else None
         local = data.get("local")
         if local and single and single.get("name"):
-            local = os.path.join(local, single["name"])
+            name = single["name"]
+            # local 已是完整文件路径时不再拼接；仅当像目录时才补文件名
+            if os.path.basename(str(local).rstrip("/\\")) != name:
+                local = os.path.join(local, name)
         task["saved_to"] = os.path.relpath(local, self.download_dir) if local else "."
         task["pan_path"] = (single or {}).get("saved_path") or data.get("saved_path")
         sizes = [it["size"] for it in items if isinstance(it.get("size"), int)]

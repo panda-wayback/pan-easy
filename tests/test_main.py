@@ -90,9 +90,15 @@ def _combined_flow(client, work, downloads):
             break
         time.sleep(0.05)
     assert task["status"] == "done", task
-    assert task["progress"] == 100 and task["saved_to"] == f"{len(b'shared-content')}/shared.bin"
-    assert task["pan_path"] == "我的应用数据/bdpan/2026-10-03/shared.bin"
-    assert (downloads / str(len(b"shared-content")) / "shared.bin").read_bytes() == b"shared-content"
+    assert task["progress"] == 100 and task["saved_to"] == f"{len(b'shared-content')}/{task_id}/shared.bin"
+    import re
+    from datetime import datetime
+    month = datetime.now().astimezone().strftime("%Y%m")
+    assert re.fullmatch(
+        rf"我的应用数据/bdpan/整理/{month}/[0-9a-f]{{6}}/shared\.bin",
+        task["pan_path"] or "",
+    )
+    assert (downloads / str(len(b"shared-content")) / task_id / "shared.bin").read_bytes() == b"shared-content"
 
     res = client.post(f"/api/tasks/{task_id}/link", headers=AUTH)
     assert res.status_code == 200

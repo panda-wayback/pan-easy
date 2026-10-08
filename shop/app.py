@@ -37,6 +37,16 @@ def cost_uses(total_bytes: int) -> int:
     if total_bytes <= 0:
         return 1
     return max(1, (total_bytes + BYTES_PER_USE - 1) // BYTES_PER_USE)
+
+
+def title_from_names(names: list) -> Optional[str]:
+    """由预览文件名生成展示标题：单文件全名，多文件「首名 等N个文件」。"""
+    clean = [n for n in names if isinstance(n, str) and n.strip()]
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    return f"{clean[0]} 等{len(clean)}个文件"
 _DL_HEADERS = ("content-type", "content-length", "content-range", "accept-ranges",
                "content-disposition", "etag", "last-modified")
 
@@ -209,6 +219,8 @@ def create_app(
         if not isinstance(total_bytes, int) or total_bytes < 0:
             return _unavailable()
         uses = cost_uses(total_bytes)
+        names = preview_data.get("names") if isinstance(preview_data, dict) else None
+        title = title_from_names(names) if isinstance(names, list) else None
 
         status_data, err = await auth_json("/api/redeem/status", {"code": code})
         if err:
@@ -237,6 +249,8 @@ def create_app(
         data["page_expires_at"] = _iso(exp)
         data["cost"] = uses
         data["remaining"] = remaining
+        if title:
+            data["title"] = title
         return JSONResponse(body, status_code=202)
 
     @app.get("/t/{token}/task")

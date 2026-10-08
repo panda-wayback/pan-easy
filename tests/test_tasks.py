@@ -1,10 +1,23 @@
 import asyncio
 import json
+import os
+import re
+from datetime import datetime
 
 import pytest
 
 from app.bdpan import BdpanError
 from app.tasks import NoShareLink, TaskQueue, parse_share
+
+
+def _pan_dir_re() -> re.Pattern:
+    month = datetime.now().astimezone().strftime("%Y%m")
+    return re.compile(rf"^整理/{month}/[0-9a-f]{{6}}$")
+
+
+def _transfer_dir(flags: list) -> str:
+    assert "-d" in flags
+    return flags[flags.index("-d") + 1]
 
 SAMPLE = """https://pan.baidu.com/s/1gN_JChf4vaDURH-mB4AWRQ?pwd=PhPR
 通过百度网盘分享的文件：albn-aut....zip
@@ -45,18 +58,55 @@ def test_preview_returns_total_bytes_without_creating_task(tmp_path):
     items = [
         {"name": "a.bin", "size": 150_000_000, "is_dir": False},
         {"name": "b.bin", "size": 50_000_000, "is_dir": False},
-        {"name": "folder", "size": 0, "is_dir": True},
+        {"name": "folder", "size": 0, "is_dir": True},  # 无 path：无法递归，不计
     ]
     bdpan = ScriptedBdpan([("transfer list", {"items": items})])
     queue = TaskQueue(bdpan, str(tmp_path), tasks_file=str(tmp_path / "tasks.json"),
                       enable_smart_download=False)
     got = asyncio.run(queue.preview("https://pan.baidu.com/s/1abc 提取码：abcd"))
-    assert got == {"total_bytes": 200_000_000}
+    assert got == {"total_bytes": 200_000_000, "names": ["a.bin", "b.bin"]}
     assert bdpan.calls == [
         ("transfer list", ["https://pan.baidu.com/s/1abc?pwd=abcd"], ["-p", "abcd"]),
     ]
     assert queue.list() == []
     assert not (tmp_path / "tasks.json").exists()
+
+
+def test_preview_recurses_into_share_dirs(tmp_path):
+    """预览递归展开目录，目录内大文件计入 total_bytes（计费依据）。"""
+    root = [
+        {"name": "a.pt", "size": 22_500_000, "is_dir": False},
+        {"name": "b.dmg", "size": 67_800_000, "is_dir": False},
+        {"name": "c.docx", "size": 7_700_000, "is_dir": False},
+        {"name": "book", "size": 0, "is_dir": True, "path": "/book"},
+    ]
+    nested = [
+        {"name": "big.pdf", "size": 299_000_000, "is_dir": False},
+    ]
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": root, "has_more": False}),
+        ("transfer list", {"items": nested, "has_more": False}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+    got = asyncio.run(queue.preview("https://pan.baidu.com/s/1mix?pwd=8vtg"))
+    assert got["total_bytes"] == 22_500_000 + 67_800_000 + 7_700_000 + 299_000_000
+    assert got["names"] == ["a.pt", "b.dmg", "c.docx", "big.pdf"]
+    assert bdpan.calls == [
+        ("transfer list", ["https://pan.baidu.com/s/1mix?pwd=8vtg"], ["-p", "8vtg"]),
+        ("transfer list", ["https://pan.baidu.com/s/1mix?pwd=8vtg"],
+         ["-p", "8vtg", "--source-dir", "/book"]),
+    ]
+
+
+def test_preview_paginates_transfer_list(tmp_path):
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [{"name": "a.bin", "size": 1, "is_dir": False}], "has_more": True}),
+        ("transfer list", {"items": [{"name": "b.bin", "size": 2, "is_dir": False}], "has_more": False}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+    got = asyncio.run(queue.preview("https://pan.baidu.com/s/1page"))
+    assert got == {"total_bytes": 3, "names": ["a.bin", "b.bin"]}
+    assert bdpan.calls[1][2] == ["--page", "2"]
 
 
 def test_preview_propagates_bdpan_error(tmp_path):
@@ -100,6 +150,8 @@ class ScriptedBdpan:
         return outcome
 
     async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+        from pathlib import Path
+
         self.calls.append((command, list(positionals), list(flags)))
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -107,6 +159,20 @@ class ScriptedBdpan:
             outcome = self._take(command)
             if isinstance(outcome, Exception):
                 raise outcome
+            # 模拟 bdpan 落盘，供下载后校验与打包
+            if command == "download" and len(positionals) >= 2:
+                dest = Path(positionals[1])
+                if dest.name:  # 文件路径而非目录
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    size = 0
+                    if isinstance(outcome, dict):
+                        for it in outcome.get("items") or []:
+                            if isinstance(it, dict) and it.get("name") == dest.name:
+                                if isinstance(it.get("size"), int):
+                                    size = it["size"]
+                                break
+                    if not dest.is_file():
+                        dest.write_bytes(b"x" * size)
             return outcome
         finally:
             self.active -= 1
@@ -150,8 +216,7 @@ def _single_steps(outcome=None, target_dir="我的应用数据/bdpan/d"):
 
 
 def test_single_file_full_flow(tmp_path):
-    target = str(tmp_path / "5") + "/"
-    bdpan = ScriptedBdpan(_single_steps()(target))
+    bdpan = ScriptedBdpan(_single_steps()("ignored"))
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
     async def scenario():
@@ -160,14 +225,19 @@ def test_single_file_full_flow(tmp_path):
         return task
 
     got = queue.get(asyncio.run(scenario())["id"])
-    assert bdpan.calls == [
-        ("transfer list", ["https://pan.baidu.com/s/1aaa?pwd=1111"], ["-p", "1111"]),
-        ("transfer", ["https://pan.baidu.com/s/1aaa?pwd=1111"], ["-p", "1111"]),
+    dest = str(tmp_path / "5" / got["id"] / "a.txt")
+    assert bdpan.calls[0] == (
+        "transfer list", ["https://pan.baidu.com/s/1aaa?pwd=1111"], ["-p", "1111"])
+    assert bdpan.calls[1][0] == "transfer"
+    assert bdpan.calls[1][1] == ["https://pan.baidu.com/s/1aaa?pwd=1111"]
+    assert bdpan.calls[1][2][:2] == ["-p", "1111"]
+    assert _pan_dir_re().match(_transfer_dir(bdpan.calls[1][2]))
+    assert bdpan.calls[2:] == [
         ("ls", ["/apps/bdpan/d"], []),
-        ("download", ["/apps/bdpan/d/a.txt", target], []),
+        ("download", ["/apps/bdpan/d/a.txt", dest], []),
     ]
     assert got["status"] == "done" and got["progress"] == 100
-    assert got["saved_to"] == "5/a.txt"
+    assert got["saved_to"] == f"5/{got['id']}/a.txt"
     assert got["pan_path"] == "我的应用数据/bdpan/d/a.txt"
     assert got["total"] == got["downloaded"] == 5
 
@@ -201,13 +271,16 @@ class ConcurrencyStub:
                 for n in ("a.txt", "b.txt")
             ]
         if command == "download":
+            from pathlib import Path
             self.dl_active += 1
             self.max_dl_active = max(self.max_dl_active, self.dl_active)
             try:
                 await asyncio.sleep(self.hold)
-                name = self._name(positionals[0])
-                return {"local": str(self.tmp / "5") + "/",
-                        "items": [{"name": name, "size": 5}]}
+                name = os.path.basename(positionals[1]) if len(positionals) > 1 else self._name(positionals[0])
+                dest = Path(positionals[1])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"x" * 5)
+                return {"local": positionals[1], "items": [{"name": name, "size": 5}]}
             finally:
                 self.dl_active -= 1
         raise AssertionError(command)
@@ -241,7 +314,7 @@ def test_downloads_serial_when_max_one(tmp_path):
 # ---- 第一步 本地缓存 ---------------------------------------------------
 
 def test_local_cache_short_circuits(tmp_path):
-    cached = tmp_path / "5" / "a.txt"
+    cached = tmp_path / "5" / "prev" / "a.txt"
     cached.parent.mkdir(parents=True)
     cached.write_text("12345")
     bdpan = ScriptedBdpan([("transfer list", {"items": [ITEM]})])
@@ -253,20 +326,19 @@ def test_local_cache_short_circuits(tmp_path):
 
     asyncio.run(scenario())
     got = queue.list()[0]
-    assert got["status"] == "done" and got["saved_to"] == "5/a.txt"
+    assert got["status"] == "done" and got["saved_to"] == "5/prev/a.txt"
     assert [c[0] for c in bdpan.calls] == ["transfer list"]
 
 
 def test_local_cache_size_mismatch_misses(tmp_path):
-    cached = tmp_path / "5" / "a.txt"
+    cached = tmp_path / "5" / "prev" / "a.txt"
     cached.parent.mkdir(parents=True)
     cached.write_text("12")  # 大小不符
-    target = str(tmp_path / "5") + "/"
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [PAN_FILE]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
@@ -275,17 +347,17 @@ def test_local_cache_size_mismatch_misses(tmp_path):
         await wait_finished(queue, 1)
 
     asyncio.run(scenario())
-    assert queue.list()[0]["status"] == "done"
+    got = queue.list()[0]
+    assert got["status"] == "done" and got["saved_to"] == f"5/{got['id']}/a.txt"
 
 
 # ---- 第二步 云盘去重 ---------------------------------------------------
 
 def test_netdisk_dedup_skips_transfer(tmp_path):
-    target = str(tmp_path / "5") + "/"
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("search", {"items": [PAN_FILE]}),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path))  # smart 默认开
 
@@ -294,10 +366,174 @@ def test_netdisk_dedup_skips_transfer(tmp_path):
         await wait_finished(queue, 1)
 
     asyncio.run(scenario())
+    got = queue.list()[0]
+    dest = str(tmp_path / "5" / got["id"] / "a.txt")
     commands = [c[0] for c in bdpan.calls]
     assert "search" in commands and "transfer" not in commands
-    assert bdpan.calls[2] == ("download", ["/apps/bdpan/d/a.txt", target], [])
-    assert queue.list()[0]["saved_to"] == "5/a.txt"
+    assert bdpan.calls[2] == ("download", ["/apps/bdpan/d/a.txt", dest], [])
+    assert got["saved_to"] == f"5/{got['id']}/a.txt"
+
+
+def test_transfer_uses_date_task_dir(tmp_path):
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [PAN_FILE]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa?pwd=1111")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    transfer_call = next(c for c in bdpan.calls if c[0] == "transfer")
+    assert transfer_call[2][:2] == ["-p", "1111"]
+    assert _pan_dir_re().match(_transfer_dir(transfer_call[2]))
+
+
+def test_dir_share_expands_to_single_file(tmp_path):
+    """目录分享展开后仅一个文件时按单文件交付，不打包、size_key 用文件大小。"""
+    folder = {"name": "book", "size": 0, "is_dir": True}
+    inner = {
+        "path": "/apps/bdpan/d/book/a.pdf",
+        "server_filename": "a.pdf",
+        "size": 100,
+        "isdir": False,
+    }
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [folder]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [{"path": "/apps/bdpan/d/book", "server_filename": "book", "size": 0, "isdir": True}]),
+        ("ls", [inner]),  # 展开目录
+        ("download", {"local": "ignored", "items": [{"name": "a.pdf", "size": 100}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1dir")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert got["saved_to"] == f"100/{got['id']}/a.pdf"
+    assert got["total"] == 100
+    assert not (tmp_path / "0").exists()
+    assert (tmp_path / "100" / got["id"] / "a.pdf").is_file()
+    # 不应出现「没有可打包的文件」
+    assert got.get("error") is None
+    download = next(c for c in bdpan.calls if c[0] == "download")
+    assert download[1][0] == "/apps/bdpan/d/book/a.pdf"
+
+
+def test_dir_share_expands_to_zip(tmp_path):
+    folder = {"name": "pack", "size": 0, "is_dir": True}
+    files = [
+        {"path": "/apps/bdpan/d/pack/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
+        {"path": "/apps/bdpan/d/pack/b.txt", "server_filename": "b.txt", "size": 5, "isdir": False},
+    ]
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [folder]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [{"path": "/apps/bdpan/d/pack", "server_filename": "pack", "size": 0, "isdir": True}]),
+        ("ls", files),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "b.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1pack")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert got["saved_to"] == f"10/{got['id']}.zip"
+    assert (tmp_path / "10" / f"{got['id']}.zip").is_file()
+
+
+def test_dir_share_empty_fails(tmp_path):
+    folder = {"name": "empty", "size": 0, "is_dir": True}
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [folder]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [{"path": "/apps/bdpan/d/empty", "server_filename": "empty", "size": 0, "isdir": True}]),
+        ("ls", []),  # 空目录
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        queue.submit("https://pan.baidu.com/s/1empty")
+        await wait_finished(queue, 1)
+
+    asyncio.run(scenario())
+    got = queue.list()[0]
+    assert got["status"] == "failed"
+    assert "空" in (got.get("error") or {}).get("message", "")
+
+
+def test_netdisk_dedup_multi_all_hit_skips_transfer(tmp_path):
+    two = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 7, "is_dir": False},
+    ]
+    found = [
+        {"path": "/apps/bdpan/old/t1/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
+        {"path": "/apps/bdpan/old/t2/b.txt", "server_filename": "b.txt", "size": 7, "isdir": False},
+    ]
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": two}),
+        ("search", {"items": [found[0]]}),
+        ("search", {"items": [found[1]]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "b.txt", "size": 7}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path))
+
+    async def scenario():
+        queue.submit("https://pan.baidu.com/s/1multi")
+        await wait_finished(queue, 1)
+
+    asyncio.run(scenario())
+    got = queue.list()[0]
+    assert "transfer" not in [c[0] for c in bdpan.calls]
+    assert got["status"] == "done"
+    assert got["saved_to"] == f"12/{got['id']}.zip"
+
+
+def test_netdisk_dedup_multi_partial_still_transfers(tmp_path):
+    two = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 7, "is_dir": False},
+    ]
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": two}),
+        ("search", {"items": [PAN_FILE]}),  # 只命中 a.txt
+        ("search", {"items": []}),  # b.txt 未命中
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [
+            {"path": "/apps/bdpan/d/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
+            {"path": "/apps/bdpan/d/b.txt", "server_filename": "b.txt", "size": 7, "isdir": False},
+        ]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "b.txt", "size": 7}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path))
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1partial")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert [c[0] for c in bdpan.calls].count("transfer") == 1
+    transfer_call = next(c for c in bdpan.calls if c[0] == "transfer")
+    assert _pan_dir_re().match(_transfer_dir(transfer_call[2]))
+    assert got["status"] == "done"
 
 
 # ---- 第三步 任务合并 ---------------------------------------------------
@@ -320,8 +556,11 @@ class SubmittedStub:
         if command == "ls":
             return [PAN_FILE]
         if command == "download":
-            target = str(self.tmp / "5") + "/"
-            return {"local": target, "items": [{"name": "a.txt", "size": 5}]}
+            from pathlib import Path
+            dest = Path(positionals[1])
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"x" * 5)
+            return {"local": positionals[1], "items": [{"name": "a.txt", "size": 5}]}
         raise AssertionError(command)
 
 
@@ -338,38 +577,40 @@ def test_alias_same_url_during_submitted_wait(tmp_path):
 
     first, second = asyncio.run(scenario())
     got_b = queue.get(second["id"])
-    assert got_b["alias_of"] == first["id"]
-    assert got_b["status"] == "done" and got_b["saved_to"] == "5/a.txt"
-    # 只有源任务发起了一次 transfer 与一次 download
+    # 进行中合并为 alias；若源已完成落盘则走本地文件复用
+    assert got_b["status"] == "done"
+    assert got_b["saved_to"] == f"5/{first['id']}/a.txt"
+    assert got_b["alias_of"] == first["id"] or got_b.get("error", {}).get("code") == "local_exists"
     assert [c[0] for c in bdpan.calls].count("transfer") == 1
     assert [c[0] for c in bdpan.calls].count("download") == 1
 
 
 def test_alias_same_items_different_url(tmp_path):
-    target = str(tmp_path / "5") + "/"
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [PAN_FILE]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
         ("transfer list", {"items": [dict(ITEM)]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
     async def scenario():
         first = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
         second = queue.submit("https://pan.baidu.com/s/2zzz")
         await wait_finished(queue, 2)
         return first, second
 
     first, second = asyncio.run(scenario())
     got_b = queue.get(second["id"])
-    assert got_b["alias_of"] == first["id"]
-    assert got_b["saved_to"] == "5/a.txt"
+    # 源已完成后，同内容优先本地文件复用（不必再 alias）
+    assert got_b["status"] == "done" and got_b["saved_to"] == f"5/{first['id']}/a.txt"
+    assert got_b["error"]["code"] == "local_exists"
+    assert [c[0] for c in bdpan.calls].count("download") == 1
 
 
 def test_partial_overlap_not_merged(tmp_path):
-    target = str(tmp_path / "5") + "/"
     two_items = [
         {"name": "a.txt", "size": 5, "is_dir": False},
         {"name": "b.txt", "size": 5, "is_dir": False},
@@ -379,12 +620,12 @@ def test_partial_overlap_not_merged(tmp_path):
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [{"path": "/apps/bdpan/d/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
                 {"path": "/apps/bdpan/d/b.txt", "server_filename": "b.txt", "size": 5, "isdir": False}]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
-        ("download", {"local": target, "items": [{"name": "b.txt", "size": 5}]}),
+        ("download", {"local": "a", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "b", "items": [{"name": "b.txt", "size": 5}]}),
         ("transfer list", {"items": [ITEM]}),
         ("transfer", {"target_dir": "我的应用数据/bdpan/e"}),
         ("ls", [PAN_FILE]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "c", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
@@ -397,6 +638,289 @@ def test_partial_overlap_not_merged(tmp_path):
     second = [t for t in queue.list() if t["url"].endswith("2bbb")][0]
     assert second["alias_of"] is None and second["status"] == "done"
     assert [c[0] for c in bdpan.calls].count("transfer") == 2
+
+
+def test_multi_file_archives_to_zip(tmp_path):
+    """多文件下载后打成 task_id.zip；散文件清理掉。"""
+    import zipfile
+    from pathlib import Path
+
+    two_items = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 5, "is_dir": False},
+    ]
+    pan = [
+        {"path": "/apps/bdpan/d/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
+        {"path": "/apps/bdpan/d/b.txt", "server_filename": "b.txt", "size": 5, "isdir": False},
+    ]
+
+    class WritingBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            if command == "download" and len(positionals) >= 2:
+                dest = Path(positionals[1])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"hello" if dest.name == "a.txt" else b"world")
+            return await super().run(command, positionals, flags, stdin, on_output)
+
+    bdpan = WritingBdpan([
+        ("transfer list", {"items": two_items}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", pan),
+        ("download", {"local": "a", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "b", "items": [{"name": "b.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert got["saved_to"] == f"10/{got['id']}.zip"
+    assert not got["saved_to"].endswith(got["id"])  # 绝不能是工作目录
+    assert got["total"] == got["downloaded"] == 10
+    assert got["speed"] is None and got["eta"] is None
+    zip_path = tmp_path / "10" / f"{got['id']}.zip"
+    assert zip_path.is_file() and zip_path.stat().st_size > 5
+    assert not (tmp_path / "10" / got["id"]).exists()
+    with zipfile.ZipFile(zip_path) as zf:
+        assert set(zf.namelist()) == {"a.txt", "b.txt"}
+        assert zf.read("a.txt") == b"hello"
+        assert zf.read("b.txt") == b"world"
+        assert {(i.filename, i.file_size) for i in zf.infolist() if not i.is_dir()} == {
+            ("a.txt", 5), ("b.txt", 5),
+        }
+
+
+def test_multi_file_progress_aggregates_across_files(tmp_path):
+    """多文件下载中 progress/downloaded/total 为整包，不被当前文件覆盖。"""
+    from pathlib import Path
+
+    two_items = [
+        {"name": "a.bin", "size": 100, "is_dir": False},
+        {"name": "b.bin", "size": 100, "is_dir": False},
+    ]
+    pan = [
+        {"path": "/apps/bdpan/d/a.bin", "server_filename": "a.bin", "size": 100, "isdir": False},
+        {"path": "/apps/bdpan/d/b.bin", "server_filename": "b.bin", "size": 100, "isdir": False},
+    ]
+    seen = []
+
+    class ProgressBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            if command == "download" and on_output is not None:
+                dest = Path(positionals[1])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"x" * 100)
+                # 当前文件报 50/100；整包应是 base+50
+                on_output("50% (50/100 B, 10 B/s) [0s:5s]\n")
+                task = queue.get(task_id)
+                seen.append((task["downloaded"], task["total"], task["progress"], task["eta"]))
+            return await super().run(command, positionals, flags, stdin, on_output)
+
+    bdpan = ProgressBdpan([
+        ("transfer list", {"items": two_items}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", pan),
+        ("download", {"local": "a", "items": [{"name": "a.bin", "size": 100}]}),
+        ("download", {"local": "b", "items": [{"name": "b.bin", "size": 100}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+    task_id = None
+
+    async def scenario():
+        nonlocal task_id
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        task_id = task["id"]
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert seen[0] == (50, 200, 25, 15)   # 第一个文件中途：50/200
+    assert seen[1] == (150, 200, 75, 5)    # 第二个文件中途：100+50 / 200
+    assert got["total"] == got["downloaded"] == 200
+    assert got["eta"] is None and got["speed"] is None
+
+
+def test_empty_workdir_cleaned_before_download(tmp_path):
+    """下载前若工作目录为空则删掉重建，不把空目录当成已有内容。"""
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [PAN_FILE]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        # 抢在下载前塞一个空目录（模拟上次失败残留）
+        empty = tmp_path / "5" / task["id"]
+        empty.mkdir(parents=True, exist_ok=True)
+        assert list(empty.iterdir()) == []
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert (tmp_path / "5" / got["id"] / "a.txt").is_file()
+
+
+def test_download_missing_local_file_fails(tmp_path):
+    """bdpan 声称成功但未落盘时任务失败，不留下空目录冒充完成。"""
+    class NoWriteBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            # 跳过父类落盘逻辑
+            self.calls.append((command, list(positionals), list(flags)))
+            outcome = self._take(command)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    bdpan = NoWriteBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [PAN_FILE]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "failed"
+    assert got["error"]["code"] == "bdpan_error"
+    assert not (tmp_path / "5" / got["id"]).exists()
+
+
+def test_multi_file_reuses_existing_zip(tmp_path):
+    """多文件按 zip 成员名+大小比对复用；无任务历史、仅有 zip 也能命中。"""
+    import zipfile
+
+    two_items = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 5, "is_dir": False},
+    ]
+    planted = tmp_path / "10" / "old.zip"
+    planted.parent.mkdir(parents=True)
+    with zipfile.ZipFile(planted, "w") as zf:
+        zf.writestr("a.txt", b"hello")
+        zf.writestr("b.txt", b"world")
+
+    bdpan = ScriptedBdpan([("transfer list", {"items": two_items})])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done" and got["saved_to"] == "10/old.zip"
+    assert got["error"]["code"] == "local_exists"
+    assert [c[0] for c in bdpan.calls] == ["transfer list"]
+    assert (tmp_path / "10" / "old.zip").is_file()
+
+
+def test_multi_does_not_treat_empty_dir_as_deliverable(tmp_path):
+    """空目录不得被当成多文件完成物；必须重新下载并打出校验通过的 zip。"""
+    import zipfile
+    from pathlib import Path
+
+    two_items = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 5, "is_dir": False},
+    ]
+    pan = [
+        {"path": "/apps/bdpan/d/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
+        {"path": "/apps/bdpan/d/b.txt", "server_filename": "b.txt", "size": 5, "isdir": False},
+    ]
+    (tmp_path / "10" / "ghost").mkdir(parents=True)  # 空目录，像以前残留的 task 工作目录
+
+    class WritingBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            if command == "download" and len(positionals) >= 2:
+                dest = Path(positionals[1])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"hello" if dest.name == "a.txt" else b"world")
+            return await super().run(command, positionals, flags, stdin, on_output)
+
+    bdpan = WritingBdpan([
+        ("transfer list", {"items": two_items}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", pan),
+        ("download", {"local": "a", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "b", "items": [{"name": "b.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done"
+    assert got["saved_to"] == f"10/{got['id']}.zip"
+    assert got["saved_to"].endswith(".zip")
+    zip_path = tmp_path / got["saved_to"]
+    assert zip_path.is_file() and not zip_path.is_dir()
+    with zipfile.ZipFile(zip_path) as zf:
+        assert {(i.filename, i.file_size) for i in zf.infolist() if not i.is_dir()} == {
+            ("a.txt", 5), ("b.txt", 5),
+        }
+    assert [c[0] for c in bdpan.calls].count("download") == 2
+
+
+def test_multi_file_zip_size_mismatch_does_not_reuse(tmp_path):
+    """zip 内文件大小与分享不一致时不复用。"""
+    import zipfile
+    from pathlib import Path
+
+    two_items = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 5, "is_dir": False},
+    ]
+    pan = [
+        {"path": "/apps/bdpan/d/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
+        {"path": "/apps/bdpan/d/b.txt", "server_filename": "b.txt", "size": 5, "isdir": False},
+    ]
+    stale = tmp_path / "10" / "stale.zip"
+    stale.parent.mkdir(parents=True)
+    with zipfile.ZipFile(stale, "w") as zf:
+        zf.writestr("a.txt", b"hi")  # 大小 2 ≠ 5
+        zf.writestr("b.txt", b"world")
+
+    class WritingBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            if command == "download" and len(positionals) >= 2:
+                dest = Path(positionals[1])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"hello" if dest.name == "a.txt" else b"world")
+            return await super().run(command, positionals, flags, stdin, on_output)
+
+    bdpan = WritingBdpan([
+        ("transfer list", {"items": two_items}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", pan),
+        ("download", {"local": "a", "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "b", "items": [{"name": "b.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    got = queue.get(asyncio.run(scenario())["id"])
+    assert got["status"] == "done" and got["saved_to"] == f"10/{got['id']}.zip"
+    assert [c[0] for c in bdpan.calls].count("download") == 2
 
 
 def test_alias_follows_source_failure(tmp_path):
@@ -420,10 +944,42 @@ def test_alias_follows_source_failure(tmp_path):
     assert got_b["alias_of"] is None and got_b["status"] == "failed"
 
 
+def test_done_task_not_aliased_without_local_file(tmp_path):
+    """已完成任务不参与合并；本地无文件时新任务自行下载，不挂到历史 done。"""
+    bdpan = ScriptedBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [PAN_FILE]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/e"}),
+        ("ls", [PAN_FILE]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
+
+    async def scenario():
+        first = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        # 删掉本地文件：模拟「历史 done 但盘上已无文件」
+        saved = queue.get(first["id"])["saved_to"]
+        os.remove(tmp_path / saved)
+        second = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 2)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    got_b = queue.get(second["id"])
+    assert got_b["alias_of"] is None
+    assert got_b["status"] == "done"
+    assert got_b["saved_to"] == f"5/{second['id']}/a.txt"
+    assert (tmp_path / got_b["saved_to"]).is_file()
+    assert [c[0] for c in bdpan.calls].count("download") == 2
+
+
 # ---- submitted 流程 ----------------------------------------------------
 
 def test_submitted_then_locates_and_downloads(tmp_path):
-    target = str(tmp_path / "5") + "/"
     submitted = {"status": "submitted", "target_dir": "我的应用数据/bdpan/d"}
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
@@ -431,7 +987,7 @@ def test_submitted_then_locates_and_downloads(tmp_path):
         ("ls", []),
         ("search", {"items": []}),
         ("ls", [PAN_FILE]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False,
                       transfer_timeout=10, transfer_poll_interval=0.01)
@@ -441,8 +997,9 @@ def test_submitted_then_locates_and_downloads(tmp_path):
         await wait_finished(queue, 1)
 
     asyncio.run(scenario())
+    got = queue.list()[0]
     assert [c[0] for c in bdpan.calls] == ["transfer list", "transfer", "ls", "search", "ls", "download"]
-    assert queue.list()[0]["saved_to"] == "5/a.txt"
+    assert got["saved_to"] == f"5/{got['id']}/a.txt"
 
 
 def test_submitted_times_out(tmp_path):
@@ -467,14 +1024,46 @@ def test_submitted_times_out(tmp_path):
 
 # ---- 持久化 / 删除 / 重试 / 失败 ---------------------------------------
 
+def test_download_progress_does_not_write_tasks_file(tmp_path):
+    """运行中进度只更新内存，不写 tasks_file（避免刷盘拖死事件循环）。"""
+    from pathlib import Path
+
+    tasks_file = Path(tmp_path) / "tasks.json"
+    wrote_on_progress = {"yes": False}
+
+    class ProgressBdpan(ScriptedBdpan):
+        async def run(self, command, positionals=(), flags=(), stdin=None, on_output=None):
+            if command == "download" and on_output is not None:
+                before = tasks_file.read_text(encoding="utf-8")
+                on_output("50% (2.5/5.0 MB, 1.0 MB/s) [0s:1s]\n")
+                wrote_on_progress["yes"] = tasks_file.read_text(encoding="utf-8") != before
+            return await super().run(command, positionals, flags, stdin, on_output)
+
+    bdpan = ProgressBdpan([
+        ("transfer list", {"items": [ITEM]}),
+        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
+        ("ls", [PAN_FILE]),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
+    ])
+    queue = TaskQueue(bdpan, str(tmp_path), str(tasks_file), enable_smart_download=False)
+
+    async def scenario():
+        task = queue.submit("https://pan.baidu.com/s/1aaa")
+        await wait_finished(queue, 1)
+        return task
+
+    task_id = asyncio.run(scenario())["id"]
+    assert wrote_on_progress["yes"] is False
+    assert queue.get(task_id)["status"] == "done" and queue.get(task_id)["progress"] == 100
+
+
 def test_history_persists_and_unfinished_become_interrupted(tmp_path):
     tasks_file = tmp_path / "data" / "tasks.json"
-    target = str(tmp_path / "5") + "/"
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [PAN_FILE]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), str(tasks_file), enable_smart_download=False)
 
@@ -488,7 +1077,7 @@ def test_history_persists_and_unfinished_become_interrupted(tmp_path):
     reloaded = TaskQueue(ScriptedBdpan([("transfer list", {"items": [ITEM]})]),
                          str(tmp_path), str(tasks_file), enable_smart_download=False)
     assert reloaded.get(done["id"])["status"] == "done"
-    assert reloaded.get(done["id"])["saved_to"] == "5/a.txt"
+    assert reloaded.get(done["id"])["saved_to"] == f"5/{done['id']}/a.txt"
     got = reloaded.get(pending["id"])
     assert got["status"] == "failed" and got["error"]["code"] == "interrupted"
     # 文件中不含内部字段
@@ -523,14 +1112,13 @@ def test_delete_running_task(tmp_path):
 
 
 def test_retry_failed_task(tmp_path):
-    target = str(tmp_path / "5") + "/"
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("transfer", BdpanError("bdpan_error", "网络错误", None)),
         ("transfer list", {"items": [ITEM]}),
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
         ("ls", [PAN_FILE]),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
@@ -545,21 +1133,20 @@ def test_retry_failed_task(tmp_path):
     assert new is not None and new["id"] != first["id"] and new["url"] == first["url"]
     assert queue.get(first["id"])["status"] == "failed"
     assert queue.get(new["id"])["status"] == "done"
-    assert queue.get(new["id"])["saved_to"] == "5/a.txt"
+    assert queue.get(new["id"])["saved_to"] == f"5/{new['id']}/a.txt"
     assert queue.retry("nope") is None
     assert queue.retry(new["id"]) is None
 
 
 def test_own_share_downloads_from_pan(tmp_path):
     """errno 13045：全盘找到同名同大小文件后直接下载。"""
-    target = str(tmp_path / "5") + "/"
     message = "转存失败: 分享接口失败: errno=13045, msg=prohibit transfer self share link"
     elsewhere = {"path": "/我的资源/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False}
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [ITEM]}),
         ("transfer", BdpanError("bdpan_error", message, 13045)),
         ("search", {"items": [elsewhere]}),
-        ("download", {"local": target, "items": [{"name": "a.txt", "size": 5}]}),
+        ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 
@@ -569,9 +1156,10 @@ def test_own_share_downloads_from_pan(tmp_path):
         return task
 
     got = queue.get(asyncio.run(scenario())["id"])
-    assert got["status"] == "done" and got["saved_to"] == "5/a.txt"
+    dest = str(tmp_path / "5" / got["id"] / "a.txt")
+    assert got["status"] == "done" and got["saved_to"] == f"5/{got['id']}/a.txt"
     assert [c[0] for c in bdpan.calls] == ["transfer list", "transfer", "search", "download"]
-    assert bdpan.calls[-1][1] == ["/我的资源/a.txt", target]
+    assert bdpan.calls[-1][1] == ["/我的资源/a.txt", dest]
 
 
 def test_own_share_not_found_keeps_13045(tmp_path):

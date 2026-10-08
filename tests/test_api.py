@@ -280,7 +280,7 @@ def test_tasks_preview(client, stub):
     }
     res = client.post("/tasks/preview", json={"text": "https://pan.baidu.com/s/1abc?pwd=wxyz"}, headers=AUTH)
     assert res.status_code == 200
-    assert res.json() == {"ok": True, "data": {"total_bytes": 150_000_000}}
+    assert res.json() == {"ok": True, "data": {"total_bytes": 150_000_000, "names": ["a.bin"]}}
     assert stub.calls == [
         ("transfer list", ["https://pan.baidu.com/s/1abc?pwd=wxyz"], ["-p", "wxyz"], None),
     ]

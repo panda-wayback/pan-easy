@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.testclient import TestClient
 
-from shop.app import cost_uses, create_app
+from shop.app import cost_uses, create_app, title_from_names
 
 ROOT = Path(__file__).resolve().parents[2]
 MASTER = "master-key"
@@ -47,7 +47,7 @@ class Fake:
 def upstream():
     return Fake({
         ("POST", "/api/tasks/preview"): lambda: JSONResponse(
-            {"ok": True, "data": {"total_bytes": PREVIEW_BYTES}}),
+            {"ok": True, "data": {"total_bytes": PREVIEW_BYTES, "names": ["demo.bin"]}}),
         ("POST", "/api/tasks"): lambda: JSONResponse(
             {"ok": True, "data": {"id": "abc123", "url": SHARE, "status": "queued"}}, status_code=202),
     })
@@ -123,6 +123,16 @@ def test_cost_uses(total, expected):
     assert cost_uses(total) == expected
 
 
+@pytest.mark.parametrize("names, title", [
+    ([], None),
+    (["a.pdf"], "a.pdf"),
+    (["a.pdf", "b.docx"], "a.pdf 等2个文件"),
+    (["x", "y", "z"], "x 等3个文件"),
+])
+def test_title_from_names(names, title):
+    assert title_from_names(names) == title
+
+
 @pytest.mark.parametrize("spark_code, status, code", [
     ("CODE_INVALID", 403, "card_invalid"),
     ("REQUEST_INVALID", 400, "card_invalid"),
@@ -196,9 +206,18 @@ def test_submit_redeems_then_creates_page(client, upstream, spark):
 
     assert data["id"] == "abc123" and data["page"].startswith("/t/abc123.")
     assert data["cost"] == 1 and data["remaining"] == 9
+    assert data["title"] == "demo.bin"
     assert CARD not in json.dumps(data) and MASTER not in data["page"]
     remaining = datetime.fromisoformat(data["page_expires_at"]).timestamp() - time.time()
     assert 86400 - 10 < remaining <= 86400
+
+
+def test_submit_title_for_multi_file(client, upstream, spark):
+    upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(
+        {"ok": True, "data": {"total_bytes": PREVIEW_BYTES,
+                              "names": ["缠中说禅.pdf", "其它.docx"]}})
+    data = submit(client)
+    assert data["title"] == "缠中说禅.pdf 等2个文件"
 
 
 @pytest.mark.parametrize("total_bytes, cost", [
@@ -209,7 +228,7 @@ def test_submit_redeems_then_creates_page(client, upstream, spark):
 ])
 def test_submit_cost_by_size(client, upstream, spark, total_bytes, cost):
     upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(
-        {"ok": True, "data": {"total_bytes": total_bytes}})
+        {"ok": True, "data": {"total_bytes": total_bytes, "names": ["x.bin"]}})
     spark.responses[("POST", "/api/redeem")] = lambda: JSONResponse(
         {"ok": True, "remaining": 100 - cost, "redeemed_at": "2026-10-07T23:00:00+08:00"})
     data = submit(client)

@@ -116,10 +116,13 @@ function renderHistory() {
   const list = history();
   $("history").innerHTML = list.length
     ? list.map(h => {
-        const bits = [`提交于 ${localTime(h.created_at)}`, `过期于 ${localTime(h.expires_at)}`];
+        const bits = [];
+        if (h.title) bits.push(h.url);
+        bits.push(`提交于 ${localTime(h.created_at)}`, `过期于 ${localTime(h.expires_at)}`);
         if (h.cost != null) bits.push(`扣 ${h.cost} 次`);
         if (h.remaining != null) bits.push(`剩余 ${h.remaining} 次`);
-        return `<a href="${esc(h.page)}">${esc(h.url)}<div class="meta">${esc(bits.join("，"))}</div></a>`;
+        const main = h.title || h.url;
+        return `<a href="${esc(h.page)}">${esc(main)}<div class="meta">${esc(bits.join("，"))}</div></a>`;
       }).join("")
     : `<div class="empty">还没有提交过</div>`;
 }
@@ -140,8 +143,8 @@ function initHome() {
       const t = await api("POST", "/tasks", { text: $("share").value, code });
       localStorage.setItem(CARD_STORE, code);
       const list = history();
-      list.unshift({ page: t.page, url: t.url, created_at: t.created_at, expires_at: t.page_expires_at,
-                     remaining: t.remaining, cost: t.cost });
+      list.unshift({ page: t.page, url: t.url, title: t.title, created_at: t.created_at,
+                     expires_at: t.page_expires_at, remaining: t.remaining, cost: t.cost });
       localStorage.setItem(HISTORY_STORE, JSON.stringify(list));
       location.href = t.page;
     } catch (e) {
@@ -161,7 +164,10 @@ let timer = null;
 function single(t) { return t.status === "done" && t.saved_to && t.saved_to !== "."; }
 
 function renderTask(t) {
-  const title = single(t) ? t.saved_to.split("/").pop() : "下载任务";
+  const mine = history().find(h => h.page === location.pathname);
+  const title = single(t) ? t.saved_to.split("/").pop()
+    : (mine && mine.title) ? mine.title
+    : "下载任务";
   const status = t.error && t.error.code === "interrupted" ? "已中断" : (STATUS[t.status] || t.status);
   const meta = [];
   if (t.total != null) meta.push(bytes(t.downloaded || 0) + " / " + bytes(t.total));
@@ -170,7 +176,6 @@ function renderTask(t) {
   let html = `<div class="top"><span class="title">${esc(title)}</span><span class="tag">${esc(status)}</span></div>
     <div class="meta">分享链接：${esc(t.url)}</div>
     <div class="meta">提交于 ${esc(localTime(t.created_at))}，本页过期于 ${esc(new Date(pageExp).toLocaleString())}</div>`;
-  const mine = history().find(h => h.page === location.pathname);
   if (mine && mine.cost != null) html += `<div class="meta">本次扣费 ${esc(mine.cost)} 次</div>`;
   if (mine && mine.remaining != null) html += `<div class="meta">本次提交后卡密剩余 ${esc(mine.remaining)} 次</div>`;
   if (ACTIVE.includes(t.status)) html += `<div class="bar"><i style="width:${t.progress}%"></i></div>`;
@@ -185,7 +190,7 @@ function renderTask(t) {
   if (single(t)) {
     html += `<div class="row"><button id="dl">下载文件</button><button class="ghost" id="copy">复制链接</button></div>`;
   } else if (t.status === "done") {
-    html += `<div class="msg warn">多文件任务暂不支持下载</div>`;
+    html += `<div class="msg warn">任务已完成，但没有可下载的单个文件</div>`;
   }
   html += `<div class="msg" id="task-msg"></div>`;
   $("task-card").innerHTML = html;
