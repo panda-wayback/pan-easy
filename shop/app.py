@@ -200,6 +200,29 @@ def create_app(
     async def task_page(token: str):
         return FileResponse(PAGE, media_type="text/html")
 
+    @app.post("/card/status")
+    async def card_status(request: Request):
+        try:
+            payload = await request.json()
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            return _error("invalid_argument", "请求格式错误", 400)
+        code = payload.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return _error("invalid_argument", "请输入卡密", 400)
+
+        data, err = await auth_json("/api/redeem/status", {"code": code})
+        if err:
+            return err
+        out = {}
+        for key in ("remaining", "used", "uses"):
+            value = data.get(key)
+            if not isinstance(value, int):
+                return _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
+            out[key] = value
+        return JSONResponse({"ok": True, "data": out})
+
     @app.post("/tasks")
     async def submit_task(request: Request):
         try:
@@ -240,8 +263,11 @@ def create_app(
         if err:
             return err
         remaining_now = status_data.get("remaining") if status_data else None
+        total_uses = status_data.get("uses") if status_data else None
         if not isinstance(remaining_now, int) or remaining_now < uses:
             return _error("card_used", "卡密次数不足，请充值后重新提交", 403)
+        if not isinstance(total_uses, int):
+            return _error("auth_unavailable", "卡密服务暂不可用，请稍后再试", 502)
 
         redeem_data, err = await auth_json("/api/redeem", {"code": code, "count": uses})
         if err:
@@ -263,6 +289,8 @@ def create_app(
         data["page_expires_at"] = _iso(exp)
         data["cost"] = uses
         data["remaining"] = remaining
+        data["uses"] = total_uses
+        data["total_bytes"] = total_bytes
         if title:
             data["title"] = title
         return JSONResponse(body, status_code=202)

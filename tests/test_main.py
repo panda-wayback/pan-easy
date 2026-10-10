@@ -118,8 +118,13 @@ def test_shop_flow(fake_bin, tmp_path, monkeypatch):
     (tmp_path / "drive.login").touch()
     downloads = tmp_path / "downloads"
     easy = create_app(KEY, fake_bin, download_dir=str(downloads))
-    spark = httpx.MockTransport(lambda request: httpx.Response(200, json={
-        "ok": True, "remaining": 2, "redeemed_at": "2026-10-07T23:00:00+08:00"}))
+    def spark_resp(request):
+        if request.url.path.endswith("/status"):
+            return httpx.Response(200, json={"ok": True, "uses": 3, "used": 0, "remaining": 3})
+        return httpx.Response(200, json={
+            "ok": True, "remaining": 2, "redeemed_at": "2026-10-07T23:00:00+08:00"})
+
+    spark = httpx.MockTransport(spark_resp)
     shop = create_shop(KEY, "http://baidu-easy", "http://spark-auth",
                        transport=httpx.ASGITransport(app=easy), auth_transport=spark)
 

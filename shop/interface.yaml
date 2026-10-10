@@ -23,6 +23,9 @@ input:
   - name: GET /
     type: 无参数
     desc: 首页
+  - name: POST /card/status
+    type: JSON {code}
+    desc: 只读查询按次数卡密的剩余、已用与总次数；不核销、不创建任务、不调用 baidu-easy
   - name: POST /tasks
     type: JSON {text, code}
     desc: text 为分享文字，code 为按次数卡密；预览分享大小后按 N 次核销，成功后创建下载任务并生成专属页面
@@ -45,9 +48,12 @@ output:
   - name: GET /、GET /t/{token}
     type: text/html
     desc: 同一个单文件自包含网页，不依赖外部 CDN；只调用本服务接口
+  - name: POST /card/status
+    type: JSON
+    desc: 成功时 data 为 {remaining, used, uses}：remaining 剩余次数（uses-used，可为 0 或负），used 已核销次数，uses 总次数；spark-auth 拒绝时与 POST /tasks 的卡密错误码与状态码一致；无法连接 spark-auth 时为 auth_unavailable
   - name: POST /tasks
     type: JSON
-    desc: 成功时为 baidu-easy POST /api/tasks 的响应，data 额外带 page（专属页面路径 /t/{token}）、page_expires_at（ISO 8601）、cost（本次扣费次数 N）、remaining（核销后卡密剩余次数）与 title（由预览 names 生成的展示标题）；baidu-easy 创建任务失败时与其状态码与响应体一致（次数已扣不退）
+    desc: 成功时为 baidu-easy POST /api/tasks 的响应，data 额外带 page（专属页面路径 /t/{token}）、page_expires_at（ISO 8601）、total_bytes（预览得到的本次任务总大小）、cost（本次扣费次数 N）、remaining（核销后卡密剩余次数）、uses（提交时卡密总次数快照）与 title（由预览 names 生成的展示标题）；baidu-easy 创建任务失败时与其状态码与响应体一致（次数已扣不退）
   - name: GET /t/{token}/task
     type: JSON
     desc: 与 baidu-easy GET /api/tasks/{id} 的状态码与响应体一致（任务格式见 app/tasks/interface.yaml）；成功时 data 额外带 retries_left（本页面剩余重试次数）
@@ -66,6 +72,7 @@ output:
 contract:
   - 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL 时拒绝启动并输出原因；BAIDU_EASY_MAX_TASK_BYTES 缺省为 10000000000，非法（非正整数）时拒绝启动
   - 计费：N = max(1, ceil(total_bytes / 100_000_000))，即每 100MB（1000 进制）1 次，不足按 1 次；1GB=10 次
+  - POST /card/status：code 非空字符串，否则返回 invalid_argument；只调用 spark-auth POST /api/redeem/status，成功返回 {remaining, used, uses}，失败映射为与 POST /tasks 相同的卡密错误码；不核销、不创建任务、不调用 baidu-easy
   - POST /tasks 顺序：先检查 text 含 pan.baidu.com/s/（不区分大小写）且 code 非空，不通过时不调用 spark-auth 与 baidu-easy；再调用 baidu-easy POST /api/tasks/preview 取 total_bytes 与 names 并算 N，预览失败时不调用 spark-auth、不创建任务；若 total_bytes 大于 BAIDU_EASY_MAX_TASK_BYTES 则返回 task_too_large，不调用 spark-auth、不创建任务；再调用 baidu-easy POST /api/tasks/space-check {bytes:total_bytes}，失败（含 disk_full）时原样返回且不调用 spark-auth、不创建任务；再调用 spark-auth POST /api/redeem/status {code}，remaining < N 时返回 card_used、不核销、不创建任务；够则调用 POST /api/redeem {code, count:N}，核销失败时不创建任务；核销成功后转发 {text} 给 baidu-easy POST /api/tasks
   - title：由 preview.names 生成；1 个文件为该文件名；多个为「首个文件名 等N个文件」；names 为空时不带 title
   - 核销成功后 baidu-easy 拒绝创建或之后任务失败不退次数
@@ -80,10 +87,10 @@ contract:
   - 不提供列出全部任务、删除与任何网盘管理能力；只调用 baidu-easy 的 POST /api/tasks/preview、POST /api/tasks/space-check、POST /api/tasks、GET /api/tasks/{id}、POST /api/tasks/{id}/link、POST /api/tasks/{id}/retry 与 /dl/{id}
   - 调用 baidu-easy 时只携带主密钥，不转发用户请求的 Authorization；主密钥不出现在任何响应中
   - 下载链接域名：协议优先取请求的 X-Forwarded-Proto，主机优先取 X-Forwarded-Host，否则取请求的协议与 Host；多值时取第一个
-  - 首页：填写卡密与分享文字提交，成功后跳转到专属页面
-  - 首页卡密：提交成功后保存到本浏览器本地存储，下次打开首页自动填入，输入框为密码形式；提交返回 card_invalid / card_used / card_type_mismatch / card_disabled 时删除已保存的卡密；「清除」按钮清空输入框并删除已保存的卡密；输入框下提示卡密保存在本浏览器；卡密不写入历史记录与专属页面
+  - 首页：顶部卡密区为随页面滚动固定（置顶）的显眼组件；填卡密后点「提交」调 POST /card/status，显示剩余 / 总次数与已用次数，成功后每 10 秒自动轮询刷新，清除或更换卡密时停止轮询；查询失败在组件内按原因提示。粘贴分享文字（链接，可含提取码）用独立的「提交下载」按钮提交，与卡密「提交」分开；提交成功后自动跳转到该任务专属页面
+  - 首页卡密：卡密「提交」成功后保存到本浏览器本地存储，下次打开首页自动填入，输入框为密码形式；返回 card_invalid / card_used / card_type_mismatch / card_disabled 时删除已保存的卡密；「清除」按钮清空输入框、删除已保存的卡密并停止轮询；输入框下提示卡密保存在本浏览器；卡密不写入历史记录与专属页面
   - 首页历史：列出本浏览器提交过且未过期的专属页面，主行显示 title（无则显示分享链接），副行含分享链接、提交后的剩余次数与本次扣费次数
-  - 专属页面：标题优先用历史中的 title，完成且有 saved_to 文件时用文件名覆盖；显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间，本浏览器历史中有该页面时显示卡密剩余次数与本次扣费次数，不显示卡密；未结束时每 2 秒刷新；完成且 saved_to 为单文件（含多文件打成的 zip）时有「下载文件」「复制链接」，否则提示暂不可下载；失败或中断时有剩余重试次数时显示「重试（剩余 N 次）」，用完时提示重试次数已用完；过期或无效时提示；始终有返回首页的按钮
+  - 专属页面：顶部有随滚动固定（置顶）的显眼组件，从本浏览器历史读取该页记录，只显示本任务总大小（total_bytes）、扣费次数 cost 与提交时剩余 remaining / 总次数 uses 快照，不轮询、不实时查询、不显示卡密；本浏览器无该页记录时不显示该组件；标题优先用历史中的 title，完成且有 saved_to 文件时用文件名覆盖；显示分享链接、状态、进度、已下载/总大小、速度、剩余时间、失败原因与页面过期时间；未结束时每 2 秒刷新；完成且 saved_to 为单文件（含多文件打成的 zip）时有「下载文件」「复制链接」，否则提示暂不可下载；失败或中断时有剩余重试次数时显示「重试（剩余 N 次）」，用完时提示重试次数已用完；过期或无效时提示；始终有返回首页的按钮
   - 接口错误显示 error.code 与 message，有 hint 时优先显示 hint
 depends:
   - app/api

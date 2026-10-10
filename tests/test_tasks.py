@@ -395,9 +395,11 @@ def test_transfer_uses_date_task_dir(tmp_path):
 
 
 def test_dir_share_expands_to_single_file(tmp_path):
-    """目录分享展开后仅一个文件时按单文件交付，不打包、size_key 用文件大小。"""
-    folder = {"name": "book", "size": 0, "is_dir": True}
-    inner = {
+    """目录分享在转存前只读展开，仅一个文件时按单文件交付，不打包、size_key 用文件大小。"""
+    folder = {"name": "book", "size": 0, "is_dir": True, "path": "/book"}
+    inner_share = {"name": "a.pdf", "size": 100, "is_dir": False}
+    folder_pan = {"path": "/apps/bdpan/d/book", "server_filename": "book", "size": 0, "isdir": True}
+    inner_pan = {
         "path": "/apps/bdpan/d/book/a.pdf",
         "server_filename": "a.pdf",
         "size": 100,
@@ -405,10 +407,11 @@ def test_dir_share_expands_to_single_file(tmp_path):
     }
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [folder]}),
-        ("transfer list", {"items": [folder]}),  # 大小校验：目录无 path 时无法递归
+        ("transfer list", {"items": [inner_share]}),  # 转存前只读递归 --source-dir /book
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
-        ("ls", [{"path": "/apps/bdpan/d/book", "server_filename": "book", "size": 0, "isdir": True}]),
-        ("ls", [inner]),  # 展开目录
+        ("ls", [folder_pan]),       # 定位：浅层只看到目录
+        ("ls", [folder_pan]),       # 递归列出转存目录
+        ("ls", [inner_pan]),        # 展开目录得到文件
         ("download", {"local": "ignored", "items": [{"name": "a.pdf", "size": 100}]}),
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
@@ -431,17 +434,23 @@ def test_dir_share_expands_to_single_file(tmp_path):
 
 
 def test_dir_share_expands_to_zip(tmp_path):
-    folder = {"name": "pack", "size": 0, "is_dir": True}
+    folder = {"name": "pack", "size": 0, "is_dir": True, "path": "/pack"}
+    share_files = [
+        {"name": "a.txt", "size": 5, "is_dir": False},
+        {"name": "b.txt", "size": 5, "is_dir": False},
+    ]
+    folder_pan = {"path": "/apps/bdpan/d/pack", "server_filename": "pack", "size": 0, "isdir": True}
     files = [
         {"path": "/apps/bdpan/d/pack/a.txt", "server_filename": "a.txt", "size": 5, "isdir": False},
         {"path": "/apps/bdpan/d/pack/b.txt", "server_filename": "b.txt", "size": 5, "isdir": False},
     ]
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [folder]}),
-        ("transfer list", {"items": [folder]}),  # 大小校验
+        ("transfer list", {"items": share_files}),  # 转存前只读递归 --source-dir /pack
         ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
-        ("ls", [{"path": "/apps/bdpan/d/pack", "server_filename": "pack", "size": 0, "isdir": True}]),
-        ("ls", files),
+        ("ls", [folder_pan]),
+        ("ls", [folder_pan]),  # 递归列出转存目录
+        ("ls", files),         # 展开目录
         ("download", {"local": "ignored", "items": [{"name": "a.txt", "size": 5}]}),
         ("download", {"local": "ignored", "items": [{"name": "b.txt", "size": 5}]}),
     ])
@@ -459,13 +468,10 @@ def test_dir_share_expands_to_zip(tmp_path):
 
 
 def test_dir_share_empty_fails(tmp_path):
-    folder = {"name": "empty", "size": 0, "is_dir": True}
+    folder = {"name": "empty", "size": 0, "is_dir": True, "path": "/empty"}
     bdpan = ScriptedBdpan([
         ("transfer list", {"items": [folder]}),
-        ("transfer list", {"items": [folder]}),  # 大小校验
-        ("transfer", {"target_dir": "我的应用数据/bdpan/d"}),
-        ("ls", [{"path": "/apps/bdpan/d/empty", "server_filename": "empty", "size": 0, "isdir": True}]),
-        ("ls", []),  # 空目录
+        ("transfer list", {"items": []}),  # 转存前只读递归，目录为空
     ])
     queue = TaskQueue(bdpan, str(tmp_path), enable_smart_download=False)
 

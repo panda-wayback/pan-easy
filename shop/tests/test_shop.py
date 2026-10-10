@@ -89,7 +89,8 @@ def test_pages_without_card(client, upstream, spark):
         res = client.get(path)
         assert res.status_code == 200 and "text/html" in res.headers["content-type"]
         assert "网盘文件下载" in res.text
-        assert 'id="clear-code"' in res.text and "卡密保存在本浏览器" in res.text
+        assert 'id="clear-code"' in res.text and 'id="submit-code"' in res.text
+        assert 'id="code-pin"' in res.text and "卡密保存在本浏览器" in res.text
     assert upstream.calls == [] and spark.calls == []
 
 
@@ -199,6 +200,61 @@ def test_no_task_listing(client, upstream):
     assert upstream.calls == []
 
 
+def test_card_status_returns_balance(client, upstream, spark):
+    res = client.post("/card/status", json={"code": CARD})
+    assert res.status_code == 200
+    assert res.json()["data"] == {"remaining": 10, "used": 0, "uses": 10}
+    assert [c["path"] for c in spark.calls] == ["/api/redeem/status"]
+    assert json.loads(spark.calls[0]["body"]) == {"code": CARD}
+    assert upstream.calls == []
+
+
+@pytest.mark.parametrize("body", [
+    {"code": "  "},
+    {},
+    ["not", "object"],
+])
+def test_card_status_requires_code(client, upstream, spark, body):
+    res = client.post("/card/status", json=body)
+    assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_argument"
+    assert spark.calls == [] and upstream.calls == []
+
+
+def test_card_status_non_json(client, upstream, spark):
+    res = client.post("/card/status", content=b"not json",
+                      headers={"Content-Type": "application/json"})
+    assert res.status_code == 400 and res.json()["error"]["code"] == "invalid_argument"
+    assert spark.calls == [] and upstream.calls == []
+
+
+@pytest.mark.parametrize("spark_code, code", [
+    ("CODE_INVALID", "card_invalid"),
+    ("CODE_USED", "card_used"),
+    ("CODE_TYPE_MISMATCH", "card_type_mismatch"),
+    ("BATCH_DISABLED", "card_disabled"),
+])
+def test_card_status_maps_errors(upstream, spark, spark_code, code):
+    spark.responses[("POST", "/api/redeem/status")] = spark_error(spark_code)
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                     transport=httpx.ASGITransport(app=upstream.app),
+                     auth_transport=httpx.ASGITransport(app=spark.app))
+    with TestClient(app) as client:
+        res = client.post("/card/status", json={"code": CARD})
+    assert res.status_code == 403 and res.json()["error"]["code"] == code
+    assert CARD not in res.text
+
+
+def test_card_status_missing_field_from_spark(upstream, spark):
+    spark.responses[("POST", "/api/redeem/status")] = lambda: JSONResponse(
+        {"ok": True, "remaining": 9, "used": 1})  # 缺 uses
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                     transport=httpx.ASGITransport(app=upstream.app),
+                     auth_transport=httpx.ASGITransport(app=spark.app))
+    with TestClient(app) as client:
+        res = client.post("/card/status", json={"code": CARD})
+    assert res.status_code == 502 and res.json()["error"]["code"] == "auth_unavailable"
+
+
 def test_preview_failure_skips_auth(client, upstream, spark):
     error = {"ok": False, "error": {"code": "bdpan_error", "message": "提取码错误", "errno": -9}}
     upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(error, status_code=502)
@@ -232,7 +288,8 @@ def test_submit_redeems_then_creates_page(client, upstream, spark):
     assert "authorization" not in spark.calls[0]["headers"]
 
     assert data["id"] == "abc123" and data["page"].startswith("/t/abc123.")
-    assert data["cost"] == 1 and data["remaining"] == 9
+    assert data["cost"] == 1 and data["remaining"] == 9 and data["uses"] == 10
+    assert data["total_bytes"] == PREVIEW_BYTES
     assert data["title"] == "demo.bin"
     assert CARD not in json.dumps(data) and MASTER not in data["page"]
     remaining = datetime.fromisoformat(data["page_expires_at"]).timestamp() - time.time()

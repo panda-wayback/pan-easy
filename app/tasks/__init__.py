@@ -451,12 +451,20 @@ class TaskQueue:
         self._save()
 
         # 先只读查询分享条目（transfer list），不占转存/下载名额
-        items = await self._share_items(task)
-        if not items:
+        raw = await self._share_items(task)
+        if not raw:
             raise ValueError("分享链接无效或已失效")
-        task["_items"] = items
 
-        total_bytes = await self._share_total_bytes(task, items)
+        # 目录提前只读展开为文件（与预览同一套递归逻辑），使本地缓存与云盘去重能看到目录内文件
+        items = await self._expand_share_items(task, raw)
+        if not items:
+            raise BdpanError("bdpan_error", "分享目录为空或无法列出文件", None)
+        task["_items"] = items
+        task["_had_dir"] = any(it.get("is_dir") for it in raw)
+
+        total_bytes = sum(
+            s for it in items if isinstance((s := it.get("size")), int) and not it.get("is_dir"))
+
         if total_bytes > self.max_task_bytes:
             raise _TaskFail(
                 "task_too_large",
@@ -468,7 +476,7 @@ class TaskQueue:
         if cached and self._finish_local(task, items, cached):
             return
 
-        # 第二步：云盘去重（单文件命中即免；多文件须全部命中；含目录则跳过）
+        # 第二步：云盘去重（展开后均为文件，按同名同大小全部命中才免转存）
         paths = await self._dedup_netdisk(items) if self.enable_smart_download else None
 
         if paths is not None:
@@ -491,10 +499,6 @@ class TaskQueue:
                 log.info("自己分享链接：从网盘直接下载 task=%s paths=%s", task["id"], paths)
             if paths is None:
                 return
-
-        # 目录条目展开为文件后再定工作目录，避免 size_key=0、把目录路径当文件打包
-        items, paths = await self._expand_dir_items(items, paths)
-        task["_items"] = items
 
         # 下载阶段：占用并发名额；工作目录延后到此处创建，避免合并/失败留下空目录
         async with self._download_slots:
@@ -633,12 +637,16 @@ class TaskQueue:
         data = await self.bdpan.run_subcommand("transfer", "list", [task["url"]], flags)
         return [it for it in (data or {}).get("items") or [] if isinstance(it, dict)]
 
-    async def _share_total_bytes(self, task: dict[str, Any], items: list[dict[str, Any]]) -> int:
-        """分享文件总大小（与 preview 一致：含目录内文件，1000 进制字节）。"""
-        if any(it.get("is_dir") for it in items):
-            files = await self._list_share_files(task["url"], task.get("pwd"))
-            return sum(s for it in files if isinstance((s := it.get("size")), int))
-        return sum(s for _, s in self._file_entries(items))
+    async def _expand_share_items(
+        self, task: dict[str, Any], raw: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把分享顶层条目展平为文件列表；含目录时只读递归（transfer list），不转存不下载。"""
+        if not any(it.get("is_dir") for it in raw):
+            return raw
+        files = await self._list_share_files(task["url"], task.get("pwd"))
+        return [{"name": f.get("name"), "size": f.get("size"), "is_dir": False}
+                for f in files
+                if isinstance(f.get("name"), str) and isinstance(f.get("size"), int)]
 
     # ---- 空间与清理 -------------------------------------------------
 
@@ -954,35 +962,6 @@ class TaskQueue:
             out.append({"name": name, "size": size, "path": path, "is_dir": False})
         return out
 
-    async def _expand_dir_items(
-        self, items: list[dict[str, Any]], paths: list[str]
-    ) -> tuple[list[dict[str, Any]], list[str]]:
-        """目录条目递归展开为文件；无目录时原样返回。展开后为空则报错。"""
-        if not items or not any(it.get("is_dir") for it in items):
-            return items, paths
-        if len(paths) < len(items):
-            raise BdpanError("bdpan_error", "转存结果路径与分享条目数量不一致", None)
-        new_items: list[dict[str, Any]] = []
-        new_paths: list[str] = []
-        for i, item in enumerate(items):
-            path = paths[i]
-            if not item.get("is_dir"):
-                new_items.append(item)
-                new_paths.append(path)
-                continue
-            files = await self._list_files_under(path)
-            if not files:
-                raise BdpanError(
-                    "bdpan_error",
-                    f"转存目录为空或无法列出文件：{item.get('name') or path}",
-                    None,
-                )
-            for f in files:
-                new_items.append({"name": f["name"], "size": f["size"], "is_dir": False})
-                new_paths.append(f["path"])
-        log.info("目录展开为 %s 个文件", len(new_items))
-        return new_items, new_paths
-
     # ---- 转存（全局串行） -------------------------------------------
 
     async def _transfer(self, task: dict[str, Any], items: list[dict[str, Any]]) -> Optional[list[str]]:
@@ -1002,7 +981,7 @@ class TaskQueue:
                 log.info("转存已提交，等待网盘完成 task=%s", task["id"])
                 result = await self._wait_transferred(task, items, result)
             task["status"] = "running"
-            paths = await self._locate_transferred(result, items)
+            paths = await self._locate_transferred(result, items, task.get("_had_dir", False))
         if not paths:
             raise BdpanError("bdpan_error", "转存完成但未在网盘中找到转存结果", None)
         return paths
@@ -1011,8 +990,9 @@ class TaskQueue:
                                 submitted: dict[str, Any]) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.transfer_timeout
+        had_dir = task.get("_had_dir", False)
         while True:
-            paths = await self._locate_transferred(submitted, items)
+            paths = await self._locate_transferred(submitted, items, had_dir)
             if paths:
                 return {**submitted, "_paths": paths}
             if loop.time() >= deadline:
@@ -1021,7 +1001,8 @@ class TaskQueue:
             await asyncio.sleep(self.transfer_poll_interval)
 
     async def _locate_transferred(self, submitted: dict[str, Any],
-                                  items: list[dict[str, Any]]) -> Optional[list[str]]:
+                                  items: list[dict[str, Any]],
+                                  had_dir: bool = False) -> Optional[list[str]]:
         if not items:
             return None
         if submitted.get("_paths"):
@@ -1031,6 +1012,9 @@ class TaskQueue:
             if directory:
                 try:
                     paths = _match(items, _entries(await self.bdpan.run("ls", [directory], [])))
+                    # 原分享顶层为目录、文件嵌套在内部时，才递归列出全部文件再匹配
+                    if paths is None and had_dir:
+                        paths = _match(items, await self._list_files_under(directory))
                 except BdpanError as err:
                     if err.kind in _AUTH_ERRORS:
                         raise
