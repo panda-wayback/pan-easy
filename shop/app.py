@@ -23,7 +23,8 @@ PAGE = Path(__file__).resolve().parent / "index.html"
 PAGE_TTL = 86400
 RETRY_LIMIT = 3
 _LINK_MIN = 60
-DEFAULT_BYTES_PER_USE = 300_000_000  # 默认每 300MB（1000 进制）扣 1 次
+DEFAULT_MB_PER_USE = 300  # 默认每 300MB（1000 进制）扣 1 次
+DEFAULT_BYTES_PER_USE = DEFAULT_MB_PER_USE * 1_000_000
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SHARE_RE = re.compile(r"pan\.baidu\.com/s/", re.IGNORECASE)
 _CARD_ERRORS = {
@@ -34,20 +35,23 @@ _CARD_ERRORS = {
 }
 
 
-def parse_bytes_per_use(value: Optional[Any] = None) -> int:
-    """解析每 1 次扣费对应的字节数；必须为正整数。value 优先，否则读环境变量，再默认。"""
+def parse_mb_per_use(value: Optional[Any] = None) -> int:
+    """解析每 1 次扣费对应的 MB 数（1000 进制）；必须为正整数。
+
+    value 优先，否则读环境变量 SHOP_BYTES_PER_USE（单位 MB，填 300 即 300MB），再默认。
+    """
     if value is not None:
         try:
             n = int(value)
         except (TypeError, ValueError) as e:
-            raise ValueError("SHOP_BYTES_PER_USE 必须为正整数") from e
+            raise ValueError("SHOP_BYTES_PER_USE 必须为正整数（单位 MB，如 300）") from e
         if n <= 0:
-            raise ValueError("SHOP_BYTES_PER_USE 必须为正整数")
+            raise ValueError("SHOP_BYTES_PER_USE 必须为正整数（单位 MB，如 300）")
         return n
     raw = os.getenv("SHOP_BYTES_PER_USE")
     if raw is not None and raw != "":
-        return parse_bytes_per_use(raw)
-    return DEFAULT_BYTES_PER_USE
+        return parse_mb_per_use(raw)
+    return DEFAULT_MB_PER_USE
 
 
 def cost_uses(total_bytes: int, bytes_per_use: int = DEFAULT_BYTES_PER_USE) -> int:
@@ -55,18 +59,6 @@ def cost_uses(total_bytes: int, bytes_per_use: int = DEFAULT_BYTES_PER_USE) -> i
     if total_bytes <= 0:
         return 1
     return max(1, (total_bytes + bytes_per_use - 1) // bytes_per_use)
-
-
-def _human_bytes(n: int) -> str:
-    """1000 进制人类可读大小。"""
-    units = ("B", "kB", "MB", "GB", "TB")
-    size = float(n)
-    for unit in units:
-        if size < 1000 or unit == units[-1]:
-            text = f"{size:.0f}" if unit == "B" else f"{size:.1f}"
-            return f"{text}{unit}"
-        size /= 1000
-    return f"{n}B"
 
 
 def title_from_names(names: list) -> Optional[str]:
@@ -145,11 +137,12 @@ def create_app(
     auth_transport: Optional[httpx.AsyncBaseTransport] = None,
     retries_file: Optional[str] = None,
     max_task_bytes: Optional[int] = None,
-    bytes_per_use: Optional[int] = None,
+    mb_per_use: Optional[int] = None,
 ) -> FastAPI:
     limit = parse_max_task_bytes(max_task_bytes)
-    per_use = parse_bytes_per_use(bytes_per_use)
-    billing_meta = f"按文件大小计费：每 {_human_bytes(per_use)}（{per_use} 字节）扣 1 次，不足按 1 次"
+    mb = parse_mb_per_use(mb_per_use)
+    per_use = mb * 1_000_000
+    billing_meta = f"按文件大小计费：每 {mb}MB 扣 1 次，不足按 1 次"
     page_html = PAGE.read_text(encoding="utf-8").replace("__BILLING_META__", billing_meta)
     client = httpx.AsyncClient(base_url=upstream_url, transport=transport, timeout=60.0)
     auth = httpx.AsyncClient(base_url=auth_url, transport=auth_transport, timeout=15.0)
@@ -402,7 +395,7 @@ def main() -> None:
         sys.exit(1)
     try:
         parse_max_task_bytes()
-        parse_bytes_per_use()
+        parse_mb_per_use()
     except ValueError as err:
         print(f"shop: {err}，拒绝启动", file=sys.stderr)
         sys.exit(1)

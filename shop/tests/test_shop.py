@@ -91,7 +91,8 @@ def test_pages_without_card(client, upstream, spark):
         assert "网盘文件下载" in res.text
         assert 'id="clear-code"' in res.text and 'id="submit-code"' in res.text
         assert 'id="code-pin"' in res.text and "卡密保存在本浏览器" in res.text
-        assert "300000000" in res.text and "__BILLING_META__" not in res.text
+        assert "300MB" in res.text and "300.0MB" not in res.text
+        assert "__BILLING_META__" not in res.text
     assert upstream.calls == [] and spark.calls == []
 
 
@@ -99,10 +100,10 @@ def test_page_shows_custom_granularity(upstream, spark):
     app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
                      transport=httpx.ASGITransport(app=upstream.app),
                      auth_transport=httpx.ASGITransport(app=spark.app),
-                     bytes_per_use=100_000_000)
+                     mb_per_use=100)
     with TestClient(app) as client:
         res = client.get("/")
-    assert "100000000" in res.text and "300000000" not in res.text
+    assert "100MB" in res.text and "300MB" not in res.text
 
 
 def test_submit_custom_granularity(upstream, spark):
@@ -113,7 +114,7 @@ def test_submit_custom_granularity(upstream, spark):
     app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
                      transport=httpx.ASGITransport(app=upstream.app),
                      auth_transport=httpx.ASGITransport(app=spark.app),
-                     bytes_per_use=100_000_000)
+                     mb_per_use=100)
     with TestClient(app) as client:
         data = submit(client)
     assert data["cost"] == 2 and data["remaining"] == 98
@@ -186,10 +187,20 @@ def test_cost_uses_custom(total, per_use, expected):
 
 
 @pytest.mark.parametrize("bad", [0, -1, "x"])
-def test_parse_bytes_per_use_rejects(bad):
-    from shop.app import parse_bytes_per_use
+def test_parse_mb_per_use_rejects(bad):
+    from shop.app import parse_mb_per_use
     with pytest.raises(ValueError):
-        parse_bytes_per_use(bad)
+        parse_mb_per_use(bad)
+
+
+@pytest.mark.parametrize("value, expected", [(None, 300), ("300", 300), (100, 100), ("500", 500)])
+def test_parse_mb_per_use(value, expected, monkeypatch):
+    from shop.app import parse_mb_per_use
+    if value is None:
+        monkeypatch.delenv("SHOP_BYTES_PER_USE", raising=False)
+        assert parse_mb_per_use() == expected
+    else:
+        assert parse_mb_per_use(value) == expected
 
 
 @pytest.mark.parametrize("names, title", [

@@ -22,7 +22,7 @@ input:
     desc: 与 baidu-easy 相同的单次任务大小上限（字节，1000 进制）；默认 10000000000；必须 > 0
   - name: SHOP_BYTES_PER_USE
     type: env integer
-    desc: 每 1 次扣费对应的字节数（1000 进制）；默认 300000000（300MB）；必须 > 0
+    desc: 每 1 次扣费对应的 MB 数（1000 进制）；填 300 即 300MB；默认 300；必须为正整数
   - name: GET /
     type: 无参数
     desc: 首页
@@ -73,8 +73,8 @@ output:
     type: JSON {ok:false, error:{code, message}}
     desc: 本服务自身的错误，code 取值见 errors
 contract:
-  - 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL 时拒绝启动并输出原因；BAIDU_EASY_MAX_TASK_BYTES 缺省为 10000000000，非法（非正整数）时拒绝启动；SHOP_BYTES_PER_USE 缺省为 300000000，非法（非正整数）时拒绝启动
-  - 计费：N = max(1, ceil(total_bytes / SHOP_BYTES_PER_USE))，SHOP_BYTES_PER_USE 默认 300_000_000（300MB，1000 进制），不足按 1 次；默认粒度下 1GB=4 次
+  - 未配置 BAIDU_EASY_API_KEY 或 SPARK_AUTH_URL 时拒绝启动并输出原因；BAIDU_EASY_MAX_TASK_BYTES 缺省为 10000000000，非法（非正整数）时拒绝启动；SHOP_BYTES_PER_USE 单位为 MB，缺省为 300，非法（非正整数）时拒绝启动
+  - 计费：N = max(1, ceil(total_bytes / (SHOP_BYTES_PER_USE × 1_000_000)))，SHOP_BYTES_PER_USE 默认 300（即 300MB，1000 进制），不足按 1 次；默认粒度下 1GB=4 次
   - POST /card/status：code 非空字符串，否则返回 invalid_argument；只调用 spark-auth POST /api/redeem/status，成功返回 {remaining, used, uses}，失败映射为与 POST /tasks 相同的卡密错误码；不核销、不创建任务、不调用 baidu-easy
   - POST /tasks 顺序：先检查 text 含 pan.baidu.com/s/（不区分大小写）且 code 非空，不通过时不调用 spark-auth 与 baidu-easy；再调用 baidu-easy POST /api/tasks/preview 取 total_bytes 与 names 并算 N，预览失败时不调用 spark-auth、不创建任务；若 total_bytes 大于 BAIDU_EASY_MAX_TASK_BYTES 则返回 task_too_large，不调用 spark-auth、不创建任务；再调用 baidu-easy POST /api/tasks/space-check {bytes:total_bytes}，失败（含 disk_full）时原样返回且不调用 spark-auth、不创建任务；再调用 spark-auth POST /api/redeem/status {code}，remaining < N 时返回 card_used、不核销、不创建任务；够则调用 POST /api/redeem {code, count:N}，核销失败时不创建任务；核销成功后转发 {text} 给 baidu-easy POST /api/tasks
   - title：由 preview.names 生成；1 个文件为该文件名；多个为「首个文件名 等N个文件」；names 为空时不带 title
@@ -99,7 +99,7 @@ depends:
   - app/api
 errors:
   - code: config_missing
-    desc: 未配置主密钥或卡密服务地址，或 BAIDU_EASY_MAX_TASK_BYTES / SHOP_BYTES_PER_USE 非法；进程以非零码退出
+    desc: 未配置主密钥或卡密服务地址，或 BAIDU_EASY_MAX_TASK_BYTES / SHOP_BYTES_PER_USE 非法（SHOP_BYTES_PER_USE 单位 MB）；进程以非零码退出
   - code: invalid_argument
     desc: 请求不是 JSON 对象、text 中没有百度网盘分享链接或 code 为空；HTTP 400
   - code: card_invalid
@@ -135,7 +135,7 @@ tests:
   - 余额不足：status 返回 remaining < N 时返回 403 card_used，不调用 redeem、不创建任务
   - 核销失败：spark-auth redeem 各错误码映射为对应 code 与 403，不创建任务；spark-auth 无法连接或返回非 JSON 时返回 502 auth_unavailable
   - 提交：顺序为 preview → space-check → redeem/status → redeem(count=N) → POST /api/tasks；默认粒度下计费 50MB→1、300MB→1、301MB→2、1GB→4；转发创建任务时只带 {text} 与主密钥；成功响应带 page、page_expires_at（约 24 小时后）、cost、remaining 与 title（由 names 生成）；创建任务失败响应原样返回且不带 page（次数已扣）
-  - SHOP_BYTES_PER_USE：设为其他正整数时按该粒度计费，网页计费文案随之显示该粒度；非法（非正整数）时进程拒绝启动
+  - SHOP_BYTES_PER_USE：单位 MB，设为其他正整数时按该粒度计费（如填 100 即每 100MB），网页计费文案随之显示该粒度；非法（非正整数）时进程拒绝启动
   - title：单文件为文件名；多文件为「首名 等N个文件」；preview 无 names 时响应不含 title
   - 不提供列表：GET /tasks、GET /tasks/{id} 不调用 baidu-easy
   - 网页：GET /、GET /t/{token} 无需卡密；首页含卡密「清除」按钮与保存在本浏览器的提示
@@ -144,6 +144,6 @@ tests:
   - /dl：查询参数与 Range 原样转发，206 与 Content-Range、Content-Disposition 原样返回；HEAD 无响应体；非法任务 ID 返回 404
   - baidu-easy 无法连接、返回 401 时返回 502 upstream_unavailable
   - 缺少主密钥或卡密服务地址时进程拒绝启动
-  - SHOP_BYTES_PER_USE 非正整数时进程拒绝启动；设为其他值（如 100_000_000）时按该值计费且网页文案显示该粒度
+  - SHOP_BYTES_PER_USE（单位 MB）非正整数时进程拒绝启动；设为其他值（如 100）时按该值计费且网页文案显示该粒度
   - 重试：不调用 spark-auth；转发到当前任务的 retry 路径；成功后 /task 与 /link 指向新任务且 retries_left 减 1；第 4 次返回 409 retry_exhausted 且不调用 baidu-easy；baidu-easy 拒绝（409）时原样返回且不计次数
   - 重试记录持久化：重建 shop 后同一网址仍指向重试后的任务、剩余次数不变；篡改或过期的凭证重试返回 404/410 且不调用 baidu-easy
