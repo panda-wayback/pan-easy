@@ -142,7 +142,10 @@ def create_app(
     limit = parse_max_task_bytes(max_task_bytes)
     mb = parse_mb_per_use(mb_per_use)
     per_use = mb * 1_000_000
-    billing_meta = f"按文件大小计费：每 {mb}MB 扣 1 次，不足按 1 次"
+    limit_gb = limit / 1_000_000_000
+    limit_text = f"{limit_gb:g}"
+    billing_meta = (f"按文件大小计费：每 {mb}MB 扣 1 次，不足按 1 次；"
+                    f"单次最多下载 {limit_text}GB")
     page_html = PAGE.read_text(encoding="utf-8").replace("__BILLING_META__", billing_meta)
     client = httpx.AsyncClient(base_url=upstream_url, transport=transport, timeout=60.0)
     auth = httpx.AsyncClient(base_url=auth_url, transport=auth_transport, timeout=15.0)

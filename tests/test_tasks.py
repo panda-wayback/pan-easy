@@ -1223,6 +1223,24 @@ def test_parse_max_task_bytes_rejects_non_positive():
         parse_max_task_bytes(-1)
 
 
+def test_parse_max_task_gb():
+    from app.tasks import parse_max_task_gb
+    assert parse_max_task_gb(1) == 1_000_000_000
+    assert parse_max_task_gb("0.1") == 100_000_000
+    assert parse_max_task_gb(10) == 10_000_000_000
+    assert parse_max_task_gb("2.5") == 2_500_000_000
+    for bad in (0, -1, "x", "abc"):
+        with pytest.raises(ValueError):
+            parse_max_task_gb(bad)
+
+
+def test_parse_max_task_bytes_from_gb_env(monkeypatch):
+    monkeypatch.setenv("BAIDU_EASY_MAX_TASK_GB", "0.5")
+    assert parse_max_task_bytes() == 500_000_000
+    monkeypatch.delenv("BAIDU_EASY_MAX_TASK_GB")
+    assert parse_max_task_bytes() == 10_000_000_000
+
+
 def test_task_too_large_fails_without_transfer(tmp_path):
     big = {"name": "a.bin", "size": 1000, "is_dir": False}
     bdpan = ScriptedBdpan([("transfer list", {"items": [big]})])

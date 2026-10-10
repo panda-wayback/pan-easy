@@ -17,6 +17,7 @@ from app.bdpan import BdpanError
 
 log = logging.getLogger("baidu_easy.tasks")
 
+DEFAULT_MAX_TASK_GB = 10
 DEFAULT_MAX_TASK_BYTES = 10_000_000_000
 DEFAULT_CLEANUP_INTERVAL = 3600
 DEFAULT_CLEANUP_MIN_AGE = 604800
@@ -62,20 +63,41 @@ class DiskFull(Exception):
         self.message = message
 
 
+def parse_max_task_gb(value: Optional[Any] = None) -> int:
+    """解析单次任务大小上限（字节）。
+
+    value 为 GB 数（1000 进制，支持小数，1=1GB、0.1=100MB）；未给 value 时读
+    环境变量 BAIDU_EASY_MAX_TASK_GB，再默认 10GB。必须为正数。
+    """
+    if value is None:
+        value = os.getenv("BAIDU_EASY_MAX_TASK_GB")
+    if value is None or value == "":
+        return DEFAULT_MAX_TASK_BYTES
+    try:
+        gb = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("BAIDU_EASY_MAX_TASK_GB 必须为正数（单位 GB，如 1 或 0.1）") from e
+    if gb <= 0:
+        raise ValueError("BAIDU_EASY_MAX_TASK_GB 必须为正数（单位 GB，如 1 或 0.1）")
+    return max(1, round(gb * 1_000_000_000))
+
+
 def parse_max_task_bytes(value: Optional[Any] = None, env: bool = True) -> int:
-    """解析单次任务大小上限；必须为正整数。value 优先，否则读环境变量，再默认。"""
+    """解析单次任务大小上限（字节）。
+
+    直接传字节值时按正整数字节解析；不传时读环境变量 BAIDU_EASY_MAX_TASK_GB（GB，
+    支持小数，见 parse_max_task_gb），再默认。
+    """
     if value is not None:
         try:
             n = int(value)
         except (TypeError, ValueError) as e:
-            raise ValueError("BAIDU_EASY_MAX_TASK_BYTES 必须为正整数") from e
+            raise ValueError("单次任务大小上限必须为正整数（字节）") from e
         if n <= 0:
-            raise ValueError("BAIDU_EASY_MAX_TASK_BYTES 必须为正整数")
+            raise ValueError("单次任务大小上限必须为正整数（字节）")
         return n
     if env:
-        raw = os.getenv("BAIDU_EASY_MAX_TASK_BYTES")
-        if raw is not None and raw != "":
-            return parse_max_task_bytes(raw, env=False)
+        return parse_max_task_gb()
     return DEFAULT_MAX_TASK_BYTES
 
 

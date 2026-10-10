@@ -145,9 +145,9 @@ function currentInput() {
   return el ? el.value : (localStorage.getItem(CARD_STORE) || "");
 }
 
-function renderCard({ balance, cost, totalBytes, live, message, msgCls } = {}) {
+function renderCard({ balance, cost, totalBytes, live, message, msgCls, inputValue } = {}) {
   const saved = localStorage.getItem(CARD_STORE) || "";
-  const value = currentInput() || saved;
+  const value = inputValue !== undefined ? inputValue : (currentInput() || saved);
   let html = `
     <div class="balance-head"><strong>卡密</strong>`;
   if (balance) html += live ? `<span class="tag">自动刷新</span>`
@@ -194,7 +194,7 @@ function bindCard() {
   $("clear-code").onclick = () => {
     localStorage.removeItem(CARD_STORE);
     stopBalancePoll();
-    renderCard({ message: "已清除本浏览器保存的卡密", msgCls: "ok" });
+    renderCard({ inputValue: "", message: "已清除本浏览器保存的卡密", msgCls: "ok" });
   };
 }
 

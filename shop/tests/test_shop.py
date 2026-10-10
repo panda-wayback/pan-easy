@@ -92,6 +92,7 @@ def test_pages_without_card(client, upstream, spark):
         assert 'id="clear-code"' in res.text and 'id="submit-code"' in res.text
         assert 'id="code-pin"' in res.text and "卡密保存在本浏览器" in res.text
         assert "300MB" in res.text and "300.0MB" not in res.text
+        assert "单次最多下载 10GB" in res.text
         assert "__BILLING_META__" not in res.text
     assert upstream.calls == [] and spark.calls == []
 

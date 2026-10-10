@@ -25,7 +25,7 @@ input:
     desc: 转存完成后同时下载的任务上限；默认 2，设为 1 即逐个执行
   - name: max_task_bytes
     type: integer
-    desc: 单次任务分享文件总大小上限（字节，1000 进制）；必须 > 0；默认 10000000000（10GB）
+    desc: 单次任务分享文件总大小上限（字节，1000 进制）；必须 > 0；默认 10000000000（10GB）；对外环境变量 BAIDU_EASY_MAX_TASK_GB 按 GB（支持小数）配置，解析后得到此值
   - name: cleanup_interval
     type: seconds, optional
     desc: 定时维护清理间隔；默认 3600；设为 0 关闭定时维护（按任务腾空间仍执行）

@@ -33,9 +33,9 @@ input:
   - name: BAIDU_EASY_MAX_DOWNLOADS
     type: env integer
     desc: 转存完成后同时下载的任务上限；默认 2，设为 1 即逐个执行
-  - name: BAIDU_EASY_MAX_TASK_BYTES
-    type: env integer
-    desc: 单次分享下载任务的文件总大小上限（字节，1000 进制）；默认 10000000000（10GB）；必须 > 0；shop 使用同一变量与默认值
+  - name: BAIDU_EASY_MAX_TASK_GB
+    type: env number
+    desc: 单次分享下载任务的文件总大小上限（GB，1000 进制，支持小数）；填 1 即 1GB、0.1 即 100MB；默认 10；必须为正数；shop 使用同一变量与默认值
   - name: BAIDU_EASY_CLEANUP_INTERVAL
     type: env integer
     desc: 下载目录定时维护间隔（秒）；默认 3600；设为 0 关闭定时维护（按任务腾空间仍执行）
@@ -60,7 +60,7 @@ contract:
   - 镜像内 bdpan 版本固定，构建时校验 SHA256，校验失败则构建失败
   - 镜像内不包含任何 bdpan 凭据；/data 为持久卷，bdpan 配置只写入 /data/bdpan，任务历史写入 /data/tasks.json，shop 重试记录写入 /data/shop-retries.json
   - /downloads 为下载目录卷；compose 将宿主机 ./downloads 挂载到 /downloads
-  - 单次分享下载总大小不得超过 BAIDU_EASY_MAX_TASK_BYTES；下载前按任务大小腾出本地空间，清理后仍不足则任务失败；闲置超过 BAIDU_EASY_CLEANUP_MIN_AGE 的交付物可被清理（详见 docs/server/download-space）
+  - 单次分享下载总大小不得超过 BAIDU_EASY_MAX_TASK_GB（默认 10GB）；下载前按任务大小腾出本地空间，清理后仍不足则任务失败；闲置超过 BAIDU_EASY_CLEANUP_MIN_AGE 的交付物可被清理（详见 docs/server/download-space）
   - 容器内同时运行 API 服务（8080）与 shop（8081），shop 经 127.0.0.1:8080 调用 API 服务；任一进程退出时另一进程被停止、容器退出
   - 容器未配置 SPARK_AUTH_URL 时 shop 拒绝启动并输出原因，容器随之退出
   - compose 中 8080 只绑定宿主机 127.0.0.1；对外只暴露 8081
