@@ -91,7 +91,33 @@ def test_pages_without_card(client, upstream, spark):
         assert "网盘文件下载" in res.text
         assert 'id="clear-code"' in res.text and 'id="submit-code"' in res.text
         assert 'id="code-pin"' in res.text and "卡密保存在本浏览器" in res.text
+        assert "300000000" in res.text and "__BILLING_META__" not in res.text
     assert upstream.calls == [] and spark.calls == []
+
+
+def test_page_shows_custom_granularity(upstream, spark):
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                     transport=httpx.ASGITransport(app=upstream.app),
+                     auth_transport=httpx.ASGITransport(app=spark.app),
+                     bytes_per_use=100_000_000)
+    with TestClient(app) as client:
+        res = client.get("/")
+    assert "100000000" in res.text and "300000000" not in res.text
+
+
+def test_submit_custom_granularity(upstream, spark):
+    upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(
+        {"ok": True, "data": {"total_bytes": 150_000_000, "names": ["x.bin"]}})
+    spark.responses[("POST", "/api/redeem")] = lambda: JSONResponse(
+        {"ok": True, "remaining": 98, "redeemed_at": "2026-10-07T23:00:00+08:00"})
+    app = create_app(MASTER, "http://baidu-easy", "http://spark-auth",
+                     transport=httpx.ASGITransport(app=upstream.app),
+                     auth_transport=httpx.ASGITransport(app=spark.app),
+                     bytes_per_use=100_000_000)
+    with TestClient(app) as client:
+        data = submit(client)
+    assert data["cost"] == 2 and data["remaining"] == 98
+    assert json.loads(spark.calls[-1]["body"]) == {"code": CARD, "count": 2}
 
 
 @pytest.mark.parametrize("body", [
@@ -140,13 +166,30 @@ def test_submit_rejects_disk_full_without_redeem(client, upstream, spark):
     (0, 1),
     (1, 1),
     (50_000_000, 1),
-    (100_000_000, 1),
-    (100_000_001, 2),
-    (150_000_000, 2),
-    (1_000_000_000, 10),
+    (300_000_000, 1),
+    (300_000_001, 2),
+    (600_000_000, 2),
+    (1_000_000_000, 4),
 ])
-def test_cost_uses(total, expected):
+def test_cost_uses_default(total, expected):
     assert cost_uses(total) == expected
+
+
+@pytest.mark.parametrize("total, per_use, expected", [
+    (100_000_000, 100_000_000, 1),
+    (100_000_001, 100_000_000, 2),
+    (1_000_000_000, 100_000_000, 10),
+    (500_000_000, 500_000_000, 1),
+])
+def test_cost_uses_custom(total, per_use, expected):
+    assert cost_uses(total, per_use) == expected
+
+
+@pytest.mark.parametrize("bad", [0, -1, "x"])
+def test_parse_bytes_per_use_rejects(bad):
+    from shop.app import parse_bytes_per_use
+    with pytest.raises(ValueError):
+        parse_bytes_per_use(bad)
 
 
 @pytest.mark.parametrize("names, title", [
@@ -306,9 +349,9 @@ def test_submit_title_for_multi_file(client, upstream, spark):
 
 @pytest.mark.parametrize("total_bytes, cost", [
     (50_000_000, 1),
-    (100_000_000, 1),
-    (150_000_000, 2),
-    (1_000_000_000, 10),
+    (300_000_000, 1),
+    (300_000_001, 2),
+    (1_000_000_000, 4),
 ])
 def test_submit_cost_by_size(client, upstream, spark, total_bytes, cost):
     upstream.responses[("POST", "/api/tasks/preview")] = lambda: JSONResponse(
@@ -487,3 +530,12 @@ def test_refuses_to_start_without_config(missing):
     proc = subprocess.run([sys.executable, "-m", "shop.app"], cwd=ROOT, env=env,
                           capture_output=True, text=True, timeout=30)
     assert proc.returncode != 0 and missing in proc.stderr
+
+
+@pytest.mark.parametrize("bad", ["0", "-5", "abc"])
+def test_refuses_to_start_with_bad_bytes_per_use(bad):
+    env = {**os.environ, "BAIDU_EASY_API_KEY": MASTER, "SPARK_AUTH_URL": "http://spark-auth",
+           "SHOP_BYTES_PER_USE": bad}
+    proc = subprocess.run([sys.executable, "-m", "shop.app"], cwd=ROOT, env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0 and "SHOP_BYTES_PER_USE" in proc.stderr

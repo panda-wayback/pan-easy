@@ -56,7 +56,7 @@
   <div id="code-pin" class="pin">
     <div class="card balance-card" id="code-card">
       <div class="balance-head"><strong>卡密</strong></div>
-      <div class="meta">按文件大小计费：每 100MB 扣 1 次，不足 100MB 按 1 次</div>
+      <div class="meta" id="billing-meta"></div>
       <div class="code-edit">
         <div class="row">
           <input id="code" type="password" placeholder="输入卡密" autocomplete="off">
@@ -89,6 +89,8 @@
 </div>
 
 <script>
+const BILLING_META = "__BILLING_META__";
+document.getElementById("billing-meta").textContent = BILLING_META;
 const HISTORY_STORE = "shop_history";
 const CARD_STORE = "shop_card";
 const CARD_REJECTED = ["card_invalid", "card_used", "card_type_mismatch", "card_disabled"];
@@ -151,7 +153,7 @@ function renderCard({ balance, cost, totalBytes, live, message, msgCls } = {}) {
   if (balance) html += live ? `<span class="tag">自动刷新</span>`
                             : `<span class="tag">提交时快照</span>`;
   html += `</div>
-    <div class="meta">按文件大小计费：每 100MB 扣 1 次，不足 100MB 按 1 次</div>
+    <div class="meta">${esc(BILLING_META)}</div>
     <div class="code-edit">
       <div class="row">
         <input id="code" type="password" placeholder="输入卡密" autocomplete="off" value="${esc(value)}">

@@ -9,6 +9,7 @@ services:
     environment:
       BAIDU_EASY_API_KEY: ${BAIDU_EASY_API_KEY:?请先设置 BAIDU_EASY_API_KEY}
       SPARK_AUTH_URL: ${SPARK_AUTH_URL:-http://host.docker.internal:8000}
+      SHOP_BYTES_PER_USE: ${SHOP_BYTES_PER_USE:-300000000}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

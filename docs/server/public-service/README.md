@@ -7,7 +7,7 @@
 ## 需求
 
 - 网页任何人都能打开；没有可用的卡密时不能提交
-- 卡密为 spark-auth 的按次数卡密，按分享文件总大小计费：每 100MB 扣 1 次，不足 100MB 按 1 次（1G 按 1000MB，下载 1GB 扣 10 次）；多文件分享按全部文件大小合计
+- 卡密为 spark-auth 的按次数卡密，按分享文件总大小计费：每 `SHOP_BYTES_PER_USE` 字节扣 1 次（默认 300MB，1000 进制），不足按 1 次（默认粒度下下载 1GB 扣 4 次）；多文件分享按全部文件大小合计
 - 提交时先只读查询分享信息得到文件总大小以确定扣费次数 N：链接失效、提取码错误等在这一步暴露，不扣次数、不创建任务
 - 预览总大小超过 `BAIDU_EASY_MAX_TASK_BYTES`（默认 10GB，与主服务同一上限）时拒绝，不扣次数、不创建任务；详见 [下载空间控制](../download-space/README.md)
 - 预览后检查下载目录空间（主服务先清理冷文件再判断）；仍不足时拒绝，不扣次数、不创建任务
@@ -31,12 +31,13 @@
 - 修改：`shop` `POST /tasks` 成功响应在 cost、remaining 之外增加 `uses`（提交时总次数快照），供专属页置顶组件展示
 - 修改：`shop` 网页首页卡密区改为随滚动固定的置顶组件，「查询余额」与「提交下载」分开；查询成功后浏览器每 10 秒轮询 `POST /card/status` 刷新剩余/已用/总次数，清除或更换卡密时停止轮询
 - 修改：专属页顶部新增置顶组件，从本浏览器历史读取该页记录，只显示本任务 cost 与提交时 remaining / uses 快照，不轮询
-- 修改：Module `shop` 提交流程改为：baidu-easy 只读预览 → 算 N（ceil(总字节/100_000_000)，至少 1）→ spark-auth `POST /api/redeem/status` 查剩余 → 不足则拒绝；够则 `POST /api/redeem {code, count:N}` 一次性扣 N 次 → 成功后才用主密钥创建下载任务；提交成功响应带 title（由预览文件名生成）
+- 修改：Module `shop` 提交流程改为：baidu-easy 只读预览 → 算 N（ceil(总字节/SHOP_BYTES_PER_USE)，至少 1，默认 300_000_000）→ spark-auth `POST /api/redeem/status` 查剩余 → 不足则拒绝；够则 `POST /api/redeem {code, count:N}` 一次性扣 N 次 → 成功后才用主密钥创建下载任务；提交成功响应带 title（由预览文件名生成）
 - 修改：`app/api` / `app/tasks` 分享预览只读接口返回 total_bytes 与 names（文件名列表）；shop 只调用该接口与既有任务接口
 - 取舍：文件标题取自 preview（transfer list）而非解析分享文案：纯链接也能显示，且与真实分享内容一致；完成的单文件专属页标题仍可用 saved_to 最终文件名覆盖
 - 复用：`app/api` 的 `POST /api/tasks`、`GET /api/tasks/{id}`、`POST /api/tasks/{id}/link`、`GET|HEAD /dl/{id}`、`POST /api/tasks/{id}/retry`
 - 复用：spark-auth 的 `POST /api/redeem/status` 与带 `count` 的 `POST /api/redeem`（按其核销规范接入；扣减超过剩余会废卡，故先查再扣）
 - 配置：`SPARK_AUTH_URL` 为 spark-auth 服务地址；本地调试时 shop 在容器内，填 `http://host.docker.internal:8000`
+- 配置：`SHOP_BYTES_PER_USE` 为每 1 次扣费对应的字节数（1000 进制），默认 `300000000`（300MB），必须为正整数，否则 shop 拒绝启动
 - 部署：容器内 8080 为管理页，compose 只绑定 `127.0.0.1:28080`；8081 为 shop，对外暴露 28081
 - 取舍：shop 是独立进程而非在 baidu-easy 内加公开页，baidu-easy 代码保持不变，卡密、用户隔离都只改 shop
 - 取舍：用按次数卡密而非设备激活卡密：网页读不到设备硬件标识，按次数不绑定设备，与「下载一次」的售卖方式一致
